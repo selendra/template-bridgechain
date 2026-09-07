@@ -14,7 +14,14 @@
 #   docker rm -f bridge-pg-live
 set -euo pipefail
 
-export PATH="$HOME/.nvm/versions/node/v25.9.0/bin:$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
+# Native Linux node (nvm). Pick the newest installed version rather than pinning
+# one: a hardcoded path silently vanishes on the next `nvm install`, and then
+# PATH falls back to whatever `node` the shell has — often none at all, which
+# surfaces as a confusing "command not found" deep inside the run. Same
+# auto-detect idiom as scripts/run.sh.
+NODE_BIN="${NODE_BIN:-$(ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -V | tail -1 || true)}"
+export PATH="${NODE_BIN:+$NODE_BIN:}$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_deploy_gate.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
@@ -72,9 +79,10 @@ echo "=== deploy gates + tokens (2 validators, threshold 2) ==="
 ( cd "$CONTRACTS" && forge build >/dev/null )
 cd "$CONTRACTS"
 TOKEN_SRC=$(forge create src/TestToken.sol:TestToken --rpc-url "$SRC_RPC" --private-key $KEY0 --broadcast --json --constructor-args Test TST 2>/dev/null | deployed_to)
-GATE_SRC=$(forge create src/Gate.sol:Gate --rpc-url "$SRC_RPC" --private-key $KEY0 --broadcast --json --constructor-args "[$V1,$V2]" 2 2>/dev/null | deployed_to)
+# Gate is UUPS: implementation + GateProxy running initialize(). See _deploy_gate.sh.
+GATE_SRC=$(deploy_gate "$SRC_RPC" "$KEY0" "[$V1,$V2]" 2)
 TOKEN_DST=$(forge create src/TestToken.sol:TestToken --rpc-url "$DST_RPC" --private-key $KEY0 --broadcast --json --constructor-args Test TST 2>/dev/null | deployed_to)
-GATE_DST=$(forge create src/Gate.sol:Gate --rpc-url "$DST_RPC" --private-key $KEY0 --broadcast --json --constructor-args "[$V1,$V2]" 2 2>/dev/null | deployed_to)
+GATE_DST=$(deploy_gate "$DST_RPC" "$KEY0" "[$V1,$V2]" 2)
 
 echo "    TOKEN_SRC=$TOKEN_SRC  GATE_SRC=$GATE_SRC"
 echo "    TOKEN_DST=$TOKEN_DST  GATE_DST=$GATE_DST"
@@ -148,7 +156,7 @@ write_vcfg "$ROOT/.live-val1.toml" "$V1K" "$ROOT/.live-val1-state"
 write_vcfg "$ROOT/.live-val2.toml" "$V2K" "$ROOT/.live-val2-state"
 
 # One keeper claims on BOTH chains ([[targets]]).
-cat > "$ROOT/.live-keeper.toml" <<CFG
+cat > "$LOG/.live-keeper.toml" <<CFG
 [[targets]]
 chain_id = $SRC_CHAIN
 rpc = "$SRC_RPC"
@@ -169,7 +177,7 @@ url = "$STORE_URL"
 CFG
 spawn "$ROOT/target/debug/validator $ROOT/.live-val1.toml" val1.log
 spawn "$ROOT/target/debug/validator $ROOT/.live-val2.toml" val2.log
-spawn "$ROOT/target/debug/keeper    $ROOT/.live-keeper.toml" keeper.log
+spawn "$ROOT/target/debug/keeper    $LOG/.live-keeper.toml" keeper.log
 
 echo "=== boot graphql-api (live store + BOTH gates + mutations) ==="
 spawn "$ROOT/target/debug/graphql-api --bind $GQL_BIND --store-url $STORE_URL --threshold 2 --gate $SRC_CHAIN=$SRC_RPC,$GATE_SRC --gate $DST_CHAIN=$DST_RPC,$GATE_DST --allow-mutations" graphql-api.log

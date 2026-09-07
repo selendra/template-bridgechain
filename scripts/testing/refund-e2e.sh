@@ -29,6 +29,7 @@
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_deploy_gate.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
@@ -97,12 +98,16 @@ forge build >/dev/null
 
 deploy() { # $1 = rpc, $2 = label, $3 = TOKEN|GATE
   local rpc=$1 label=$2 kind=$3 out addr
+  # Gate is UUPS — an implementation plus a GateProxy that runs
+  # initialize(). The old single `forge create Gate --constructor-args`
+  # form no longer compiles against it. See _deploy_gate.sh.
+  if [[ "$kind" == "GATE" ]]; then
+    deploy_gate "$rpc" "$KEY0" "[$V1]" 1
+    return
+  fi
   if [[ "$kind" == "TOKEN" ]]; then
     out=$(forge create src/TestToken.sol:TestToken --rpc-url "$rpc" --private-key $KEY0 \
           --broadcast --json --constructor-args Test TST 2>"$LOGS/deploy-$label-err.log")
-  else
-    out=$(forge create src/Gate.sol:Gate --rpc-url "$rpc" --private-key $KEY0 \
-          --broadcast --json --constructor-args "[$V1]" 1 2>"$LOGS/deploy-$label-err.log")
   fi
   echo "$out" > "$LOGS/deploy-$label.log"
   addr=$(echo "$out" | deployed_to || true)
@@ -148,10 +153,17 @@ cast send "$GATE_SRC" "send(address,uint256,uint256,bytes,bytes)" \
 DEBRIDGE_ID=$(cast keccak "$(cast abi-encode --packed "f(uint256,address)" "$SRC_CHAIN" "$TOKEN_SRC")")
 NONCE=0
 
-# submissionId = keccak(prefix(1), debridgeId, chainFrom, chainTo, amount, receiver, nonce)
+# The gate's own deployment generation. Read it off the gate rather than
+# assuming: it is the second field of the preimage, so a local derivation that
+# omits it produces an id that matches nothing (which is exactly how this test
+# started failing when bridgeDomain was introduced).
+GATE_DOMAIN=$(cast call "$GATE_SRC" "bridgeDomain()(bytes32)" --rpc-url $SRC_RPC)
+
+# submissionId = keccak(prefix(1), bridgeDomain, debridgeId, chainFrom, chainTo,
+#                       amount, receiver, nonce)   -- see BridgeHash.packedSubmission
 SUBMISSION_ID=$(cast keccak "$(cast abi-encode --packed \
-  "f(uint256,bytes32,uint256,uint256,uint256,bytes,uint256)" \
-  1 "$DEBRIDGE_ID" "$SRC_CHAIN" "$DST_CHAIN" "$AMOUNT" "$RECEIVER_BYTES" "$NONCE")")
+  "f(uint256,bytes32,bytes32,uint256,uint256,uint256,bytes,uint256)" \
+  1 "$GATE_DOMAIN" "$DEBRIDGE_ID" "$SRC_CHAIN" "$DST_CHAIN" "$AMOUNT" "$RECEIVER_BYTES" "$NONCE")")
 
 ONCHAIN_ID=$(cast call "$GATE_SRC" "computeSubmissionId(bytes32,uint256,uint256,uint256,uint256,bytes,bytes,bytes)(bytes32)" \
   "$DEBRIDGE_ID" "$AMOUNT" "$SRC_CHAIN" "$DST_CHAIN" "$NONCE" "$RECEIVER_BYTES" "0x" "0x" --rpc-url $SRC_RPC)
@@ -188,8 +200,8 @@ echo
 echo "=== the gate must not refund what it never sent ==="
 GHOST_NONCE=99
 GHOST_ID=$(cast keccak "$(cast abi-encode --packed \
-  "f(uint256,bytes32,uint256,uint256,uint256,bytes,uint256)" \
-  1 "$DEBRIDGE_ID" "$SRC_CHAIN" "$DST_CHAIN" "$AMOUNT" "$RECEIVER_BYTES" "$GHOST_NONCE")")
+  "f(uint256,bytes32,bytes32,uint256,uint256,uint256,bytes,uint256)" \
+  1 "$GATE_DOMAIN" "$DEBRIDGE_ID" "$SRC_CHAIN" "$DST_CHAIN" "$AMOUNT" "$RECEIVER_BYTES" "$GHOST_NONCE")")
 GHOST_REFUND_ID=$(cast keccak "$(cast abi-encode --packed "f(uint256,bytes32)" $REFUND_PREFIX "$GHOST_ID")")
 GHOST_SIG=$(cast wallet sign --private-key $V1_KEY "$GHOST_REFUND_ID")
 reverts "refund() of a never-sent submissionId reverts (NotSent)" \

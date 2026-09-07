@@ -194,10 +194,20 @@ BUILD_PKGS=(-p sig-store -p validator -p keeper -p graphql-api)
 # 3. chains (local anvil or external)
 # ---------------------------------------------------------------------------
 if [[ "$LOCAL_ANVIL" == "true" ]]; then
+  # ANVIL_BLOCK_TIME: keep the chains PRODUCING blocks, not merely accepting txs.
+  #
+  # A default anvil mines only when a transaction arrives, so an idle chain's head
+  # timestamp is frozen. Anything that measures elapsed time in block timestamps
+  # then never advances — most visibly the refund path: the validator establishes
+  # the unclaimed timeout itself by walking back to a block `REFUND_TIMEOUT_SECS`
+  # older than the head (it will not take the store's word for it), and on a
+  # frozen chain no such block ever exists, so a stranded transfer is never
+  # cancelled however long you wait. One second is imperceptible for a demo and
+  # makes the local mesh behave like a real chain.
   say "booting $N anvil chain(s)"
   for i in "${!CID[@]}"; do
     port="${CRPC[$i]##*:}"
-    spawn "anvil --chain-id ${CID[$i]} --port $port --host 127.0.0.1 --silent" "anvil-${CID[$i]}.log"
+    spawn "anvil --chain-id ${CID[$i]} --port $port --host 127.0.0.1 --silent --block-time ${ANVIL_BLOCK_TIME:-1}" "anvil-${CID[$i]}.log"
     info "${CNAME[$i]} (${CID[$i]}) on :$port"
   done
 fi

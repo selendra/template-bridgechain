@@ -22,6 +22,7 @@
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_deploy_gate.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
@@ -89,8 +90,17 @@ echo "=== building binaries ==="
 
 echo "=== starting anvil chains ==="
 pkill -f "anvil --chain-id" 2>/dev/null || true; sleep 1
-anvil --chain-id $SRC_CHAIN --port 8545 >"$LOGS/anvil-src-refund.log" 2>&1 & track $!
-anvil --chain-id $DST_CHAIN --port 8546 >"$LOGS/anvil-dst-refund.log" 2>&1 & track $!
+# --block-time 1: the chains must keep PRODUCING BLOCKS, not just accept txs.
+#
+# The validator establishes the unclaimed timeout itself, by walking back from
+# the confirmed head to a block at least `timeout_secs` older (`aged_block`) —
+# deliberately, so the store cannot talk it into burning a live transfer. That
+# age is measured in BLOCK TIMESTAMPS. A default anvil mines only when a tx
+# arrives, so once the test stops sending, the head timestamp freezes and no
+# block is ever old enough: `aged_out` stays false and the cancel never comes.
+# Wall-clock waiting cannot fix that, however long the loop sleeps.
+anvil --chain-id $SRC_CHAIN --port 8545 --block-time 1 >"$LOGS/anvil-src-refund.log" 2>&1 & track $!
+anvil --chain-id $DST_CHAIN --port 8546 --block-time 1 >"$LOGS/anvil-dst-refund.log" 2>&1 & track $!
 for url in $SRC_RPC $DST_RPC; do
   for _ in $(seq 1 50); do cast chain-id --rpc-url "$url" >/dev/null 2>&1 && break; sleep 0.2; done
 done
@@ -100,10 +110,11 @@ forge build >/dev/null
 echo "=== deploying (validator=1, threshold 1) ==="
 # Source: token + gate, funds get locked here.
 TOKEN_SRC=$(forge create src/TestToken.sol:TestToken --rpc-url "$SRC_RPC" --private-key $KEY0 --broadcast --json --constructor-args Test TST 2>/dev/null | deployed_to)
-GATE_SRC=$(forge create src/Gate.sol:Gate --rpc-url "$SRC_RPC" --private-key $KEY0 --broadcast --json --constructor-args "[$V1]" 1 2>/dev/null | deployed_to)
+# Gate is UUPS: implementation + GateProxy running initialize(). See _deploy_gate.sh.
+GATE_SRC=$(deploy_gate "$SRC_RPC" "$KEY0" "[$V1]" 1)
 # Destination: gate ONLY — deliberately no liquidity and no setLocalToken, so
 # claim() can never succeed and the transfer strands.
-GATE_DST=$(forge create src/Gate.sol:Gate --rpc-url "$DST_RPC" --private-key $KEY0 --broadcast --json --constructor-args "[$V1]" 1 2>/dev/null | deployed_to)
+GATE_DST=$(deploy_gate "$DST_RPC" "$KEY0" "[$V1]" 1)
 echo "  src: token=$TOKEN_SRC gate=$GATE_SRC"
 echo "  dst: gate=$GATE_DST  (UNFUNDED, UNREGISTERED — every claim reverts)"
 
@@ -130,7 +141,7 @@ curl -s "$STORE_URL/health" | grep -q ok || fail "sig-store did not come up"
 echo "✅ sig-store healthy"
 
 # --- indexer: observes both gates, sweeps eligible after a SHORT timeout ---
-cat > "$ROOT/indexer-refund.toml" <<EOF
+cat > "$LOGS/indexer-refund.toml" <<EOF
 database_url = "$DATABASE_URL"
 refund_timeout_secs = 5           # a transfer is "stuck" after 5s unclaimed
 sweep_interval_secs = 2           # and the sweep re-checks every 2s
@@ -157,7 +168,7 @@ max_block_range = 1000
 EOF
 
 # --- validator: signs transfers AND runs the refund attestation loop ---
-cat > "$ROOT/validator-refund.toml" <<EOF
+cat > "$LOGS/validator-refund.toml" <<EOF
 [source]
 chain_id = $SRC_CHAIN
 rpcs = ["$SRC_RPC"]
@@ -188,7 +199,7 @@ gate = "$GATE_DST"
 EOF
 
 # --- keeper: claims on the destination, refunds on the source ---
-cat > "$ROOT/keeper-refund.toml" <<EOF
+cat > "$LOGS/keeper-refund.toml" <<EOF
 [keeper]
 private_key = "$KEEPER_KEY"
 
@@ -209,9 +220,9 @@ poll_interval_ms = 300
 EOF
 
 echo "=== starting indexer + validator + keeper ==="
-"$ROOT/target/debug/indexer"   "$ROOT/indexer-refund.toml"   >"$LOGS/refund-relayer-indexer.log" 2>&1 & track $!
-"$ROOT/target/debug/validator" "$ROOT/validator-refund.toml" >"$LOGS/refund-relayer-validator.log" 2>&1 & track $!
-"$ROOT/target/debug/keeper"    "$ROOT/keeper-refund.toml"    >"$LOGS/refund-relayer-keeper.log" 2>&1 & track $!
+"$ROOT/target/debug/indexer"   "$LOGS/indexer-refund.toml"   >"$LOGS/refund-relayer-indexer.log" 2>&1 & track $!
+"$ROOT/target/debug/validator" "$LOGS/validator-refund.toml" >"$LOGS/refund-relayer-validator.log" 2>&1 & track $!
+"$ROOT/target/debug/keeper"    "$LOGS/keeper-refund.toml"    >"$LOGS/refund-relayer-keeper.log" 2>&1 & track $!
 sleep 1
 
 echo

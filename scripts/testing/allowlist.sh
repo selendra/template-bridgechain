@@ -23,12 +23,26 @@ SIG_STORE="${SIG_STORE:-http://127.0.0.1:8080}"
 # requires it unless it's running in open dev mode).
 AUTH=()
 # Allowlist mutations need the `admin` scope; fall back to the legacy secret.
-TOKEN="${SIG_STORE_ADMIN_TOKEN:-${SIG_STORE_TOKEN:-}}"
-if [ -n "$TOKEN" ]; then
-  AUTH=(-H "authorization: Bearer ${TOKEN}")
+#
+# NAMED `AUTH_TOKEN`, not `TOKEN`. These were once the same variable, which was
+# harmless only while the store ran unauthenticated: the moment a credential is
+# present — now the default, since the store refuses to serve open — the bearer
+# string survived into the ERC-20 slot below and `seed` allowlisted the SECRET
+# as a token address. That fails silently: the command reports success, the real
+# TestToken is never allowlisted, and validators withhold signatures for it.
+AUTH_TOKEN="${SIG_STORE_ADMIN_TOKEN:-${SIG_STORE_TOKEN:-}}"
+if [ -n "$AUTH_TOKEN" ]; then
+  AUTH=(-H "authorization: Bearer ${AUTH_TOKEN}")
 fi
 
-# Deterministic local anvil deploy (account #0 deploys TestToken then Gate).
+# The ERC-20 `seed` allowlists. Prefer the address the running stack actually
+# deployed; fall back to the deterministic local anvil one (account #0 deploys
+# TestToken first).
+if [ -z "${TOKEN:-}" ] && [ -f "${RUN_DIR:-/tmp/bridge-run}/addresses.env" ]; then
+  # shellcheck disable=SC1090
+  . "${RUN_DIR:-/tmp/bridge-run}/addresses.env"
+  TOKEN="${TOKEN_TST_1337:-}"
+fi
 TOKEN="${TOKEN:-0x5FbDB2315678afecb367f032d93F642f64180aa3}"
 CHAIN_A="${CHAIN_A:-1337}"
 CHAIN_B="${CHAIN_B:-1338}"

@@ -14,6 +14,7 @@
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_deploy_gate.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
@@ -78,9 +79,10 @@ cd "$CONTRACTS"
 forge build >/dev/null
 echo "=== deploying (3 validators, threshold 2) ==="
 TOKEN_SRC=$(forge create src/TestToken.sol:TestToken --rpc-url "$SRC_RPC" --private-key $KEY0 --broadcast --json --constructor-args Test TST 2>/dev/null | deployed_to)
-GATE_SRC=$(forge create src/Gate.sol:Gate --rpc-url "$SRC_RPC" --private-key $KEY0 --broadcast --json --constructor-args "[$V1,$V2,$V3]" 2 2>/dev/null | deployed_to)
+# Gate is UUPS: implementation + GateProxy running initialize(). See _deploy_gate.sh.
+GATE_SRC=$(deploy_gate "$SRC_RPC" "$KEY0" "[$V1,$V2,$V3]" 2)
 TOKEN_DST=$(forge create src/TestToken.sol:TestToken --rpc-url "$DST_RPC" --private-key $KEY0 --broadcast --json --constructor-args Test TST 2>/dev/null | deployed_to)
-GATE_DST=$(forge create src/Gate.sol:Gate --rpc-url "$DST_RPC" --private-key $KEY0 --broadcast --json --constructor-args "[$V1,$V2,$V3]" 2 2>/dev/null | deployed_to)
+GATE_DST=$(deploy_gate "$DST_RPC" "$KEY0" "[$V1,$V2,$V3]" 2)
 echo "  src: token=$TOKEN_SRC gate=$GATE_SRC"
 echo "  dst: token=$TOKEN_DST gate=$GATE_DST"
 
@@ -135,7 +137,7 @@ write_vcfg "$ROOT/val1-p7.toml" "$V1K" "$LOGS/val1-p7-state.json"
 write_vcfg "$ROOT/val2-p7.toml" "$V2K" "$LOGS/val2-p7-state.json"
 write_vcfg "$ROOT/val3-p7.toml" "$V3K" "$LOGS/val3-p7-state.json"
 
-cat > "$ROOT/keeper-p7.toml" <<EOF
+cat > "$LOGS/keeper-p7.toml" <<EOF
 [target]
 chain_id = $DST_CHAIN
 rpc = "$DST_RPC"
@@ -153,7 +155,7 @@ echo "=== starting 3 validators + keeper ==="
 start_validator "$ROOT/val1-p7.toml" val1-p7; V1_PID=$LAST_PID; track $V1_PID
 start_validator "$ROOT/val2-p7.toml" val2-p7; V2_PID=$LAST_PID; track $V2_PID
 start_validator "$ROOT/val3-p7.toml" val3-p7; V3_PID=$LAST_PID; track $V3_PID
-"$ROOT/target/debug/keeper" "$ROOT/keeper-p7.toml" >"$LOGS/keeper-p7.log" 2>&1 & KEEPER_PID=$!; track $KEEPER_PID
+"$ROOT/target/debug/keeper" "$LOGS/keeper-p7.toml" >"$LOGS/keeper-p7.log" 2>&1 & KEEPER_PID=$!; track $KEEPER_PID
 sleep 1
 
 send_one() {

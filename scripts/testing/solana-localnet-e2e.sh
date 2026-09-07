@@ -16,7 +16,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SOLANA_BIN="$HOME/.local/share/solana/install/active_release/bin"
-NODE_BIN="$HOME/.nvm/versions/node/v25.9.0/bin"
+NODE_BIN="${NODE_BIN:-$(ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -V | tail -1 || true)}"
 export PATH="$SOLANA_BIN:$NODE_BIN:$HOME/.cargo/bin:$PATH"
 RPC="http://127.0.0.1:8899"
 

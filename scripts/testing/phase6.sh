@@ -11,13 +11,14 @@
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_deploy_gate.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 STORE="$ROOT/sig-store-data-p6"
 LOGS="$ROOT/.e2e-logs"
 STATE="$LOGS/validator-state.json"
-VCFG="$ROOT/validator-p6.toml"
+VCFG="$LOGS/validator-p6.toml"
 mkdir -p "$LOGS"
 rm -rf "$STORE"; mkdir -p "$STORE"
 rm -f "$STATE"
@@ -80,8 +81,8 @@ cd "$CONTRACTS"
 forge build >/dev/null
 TOKEN=$(forge create src/TestToken.sol:TestToken --rpc-url "$SRC_RPC" --private-key $KEY0 \
         --broadcast --json --constructor-args Test TST 2>/dev/null | deployed_to)
-GATE=$(forge create src/Gate.sol:Gate --rpc-url "$SRC_RPC" --private-key $KEY0 \
-        --broadcast --json --constructor-args "[$VALIDATOR]" 1 2>/dev/null | deployed_to)
+# Gate is UUPS: implementation + GateProxy running initialize(). See _deploy_gate.sh.
+GATE=$(deploy_gate "$SRC_RPC" "$KEY0" "[$VALIDATOR]" 1)
 echo "  token=$TOKEN gate=$GATE"
 
 cast send "$TOKEN" "mint(address,uint256)" $ACC0 $TWICE --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null

@@ -16,6 +16,7 @@
 # Run from anywhere:  bash scripts/testing/db-e2e.sh
 set -euo pipefail
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_deploy_gate.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
@@ -105,10 +106,11 @@ forge build >/dev/null
 echo "=== deploying (1 validator, threshold 1); GOOD + BAD token on each chain ==="
 TOKEN_GOOD=$(forge create src/TestToken.sol:TestToken  --rpc-url "$SRC_RPC" --private-key $KEY0 --broadcast --json --constructor-args Good GOOD 2>/dev/null | deployed_to)
 TOKEN_BAD=$( forge create src/TestToken.sol:TestToken  --rpc-url "$SRC_RPC" --private-key $KEY0 --broadcast --json --constructor-args Bad  BAD  2>/dev/null | deployed_to)
-GATE_SRC=$(  forge create src/Gate.sol:Gate           --rpc-url "$SRC_RPC" --private-key $KEY0 --broadcast --json --constructor-args "[$V1]" 1 2>/dev/null | deployed_to)
+# Gate is UUPS: implementation + GateProxy running initialize(). See _deploy_gate.sh.
+GATE_SRC=$(  deploy_gate "$SRC_RPC" "$KEY0" "[$V1]" 1)
 TOKEN_GOOD_DST=$(forge create src/TestToken.sol:TestToken --rpc-url "$DST_RPC" --private-key $KEY0 --broadcast --json --constructor-args Good GOOD 2>/dev/null | deployed_to)
 TOKEN_BAD_DST=$( forge create src/TestToken.sol:TestToken --rpc-url "$DST_RPC" --private-key $KEY0 --broadcast --json --constructor-args Bad  BAD  2>/dev/null | deployed_to)
-GATE_DST=$(  forge create src/Gate.sol:Gate           --rpc-url "$DST_RPC" --private-key $KEY0 --broadcast --json --constructor-args "[$V1]" 1 2>/dev/null | deployed_to)
+GATE_DST=$(  deploy_gate "$DST_RPC" "$KEY0" "[$V1]" 1)
 echo "  src: good=$TOKEN_GOOD bad=$TOKEN_BAD gate=$GATE_SRC"
 echo "  dst: good=$TOKEN_GOOD_DST bad=$TOKEN_BAD_DST gate=$GATE_DST"
 
@@ -130,9 +132,13 @@ cast send "$GATE_DST" "setLocalToken(bytes32,address)" "$DID_GOOD" "$TOKEN_GOOD_
 cast send "$GATE_DST" "setLocalToken(bytes32,address)" "$DID_BAD"  "$TOKEN_BAD_DST"  --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 
 echo "=== starting Postgres-backed sig-store ($STORE_URL) ==="
-SIG_STORE_BIND=127.0.0.1:8080 DATABASE_URL="$DATABASE_URL" \
 # --allow-unauthenticated: local demo on 127.0.0.1, no tokens to distribute.
 # The binary now refuses to serve an open store without being told to.
+#
+# Keep this comment ABOVE the assignments: a comment line after a `\` swallows
+# the continuation, so the env prefix never reaches the command and sig-store
+# starts with no DATABASE_URL.
+SIG_STORE_BIND=127.0.0.1:8080 DATABASE_URL="$DATABASE_URL" \
   "$ROOT/target/debug/sig-store" --allow-unauthenticated >"$LOGS/db-sig-store.log" 2>&1 & track $!
 for i in $(seq 1 60); do curl -s "$STORE_URL/health" >/dev/null 2>&1 && break; sleep 0.25; done
 curl -s "$STORE_URL/health" | grep -q ok || fail "sig-store did not come up (check DATABASE_URL / migrations)"

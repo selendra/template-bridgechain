@@ -8,6 +8,7 @@
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_deploy_gate.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
@@ -53,11 +54,12 @@ done
 cd "$CONTRACTS"; forge build >/dev/null
 deploy_one() {
   local rpc=$1 label=$2 kind=$3 out addr
-  if [[ "$kind" == "TOKEN" ]]; then
-    out=$(forge create src/TestToken.sol:TestToken --rpc-url "$rpc" --private-key $KEY0 --broadcast --json --constructor-args Test TST 2>/dev/null)
-  else
-    out=$(forge create src/Gate.sol:Gate --rpc-url "$rpc" --private-key $KEY0 --broadcast --json --constructor-args "[$VALIDATOR]" 1 2>/dev/null)
+  # Gate is UUPS: implementation + GateProxy running initialize(). See _deploy_gate.sh.
+  if [[ "$kind" == "GATE" ]]; then
+    deploy_gate "$rpc" "$KEY0" "[$VALIDATOR]" 1
+    return
   fi
+  out=$(forge create src/TestToken.sol:TestToken --rpc-url "$rpc" --private-key $KEY0 --broadcast --json --constructor-args Test TST 2>/dev/null)
   addr=$(echo "$out" | deployed_to || true); [[ -n "$addr" ]] || { echo "deploy $label failed" >&2; exit 1; }; echo "$addr"
 }
 
@@ -74,7 +76,7 @@ cast send "$GATE_A" "setLocalToken(bytes32,address)" "$DEBRIDGE_B" "$TOKEN_A" --
 
 echo "=== ONE validator watching B+C; keeper -> A ==="
 rm -f "$LOGS"/res-*-state.json
-cat > "$ROOT/validator.toml" <<EOF
+cat > "$LOGS/validator.toml" <<EOF
 [[sources]]
 chain_id = $B_CHAIN
 rpc = "$B_RPC"
@@ -106,7 +108,7 @@ bind = "$API"
 # UNMOUNTED unless a token is set or this says otherwise.
 allow_unauthenticated = true
 EOF
-cat > "$ROOT/keeper.toml" <<EOF
+cat > "$LOGS/keeper.toml" <<EOF
 [[targets]]
 chain_id = $A_CHAIN
 rpc = "$A_RPC"
@@ -120,8 +122,8 @@ private_key = "$KEEPER_KEY"
 dir = "$STORE"
 EOF
 
-"$ROOT/target/debug/validator" "$ROOT/validator.toml" >"$LOGS/val-res.log" 2>&1 & VAL_PID=$!
-"$ROOT/target/debug/keeper" "$ROOT/keeper.toml" >"$LOGS/keeper.log" 2>&1 & KEEPER_PID=$!
+"$ROOT/target/debug/validator" "$LOGS/validator.toml" >"$LOGS/val-res.log" 2>&1 & VAL_PID=$!
+"$ROOT/target/debug/keeper" "$LOGS/keeper.toml" >"$LOGS/keeper.log" 2>&1 & KEEPER_PID=$!
 for i in $(seq 1 40); do curl -s "http://$API/status" >/dev/null 2>&1 && break; sleep 0.25; done
 
 echo

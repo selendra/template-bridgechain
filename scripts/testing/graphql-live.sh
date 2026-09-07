@@ -11,6 +11,7 @@
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_deploy_gate.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
@@ -71,9 +72,10 @@ done
 cd "$CONTRACTS"; forge build >/dev/null
 echo "=== deploy (2 validators, threshold $THRESHOLD) ==="
 TOKEN_SRC=$(forge create src/TestToken.sol:TestToken --rpc-url "$SRC_RPC" --private-key $KEY0 --broadcast --json --constructor-args Test TST 2>/dev/null | deployed_to)
-GATE_SRC=$(forge create src/Gate.sol:Gate --rpc-url "$SRC_RPC" --private-key $KEY0 --broadcast --json --constructor-args "[$V1,$V2]" $THRESHOLD 2>/dev/null | deployed_to)
+# Gate is UUPS: implementation + GateProxy running initialize(). See _deploy_gate.sh.
+GATE_SRC=$(deploy_gate "$SRC_RPC" "$KEY0" "[$V1,$V2]" "$THRESHOLD")
 TOKEN_DST=$(forge create src/TestToken.sol:TestToken --rpc-url "$DST_RPC" --private-key $KEY0 --broadcast --json --constructor-args Test TST 2>/dev/null | deployed_to)
-GATE_DST=$(forge create src/Gate.sol:Gate --rpc-url "$DST_RPC" --private-key $KEY0 --broadcast --json --constructor-args "[$V1,$V2]" $THRESHOLD 2>/dev/null | deployed_to)
+GATE_DST=$(deploy_gate "$DST_RPC" "$KEY0" "[$V1,$V2]" "$THRESHOLD")
 
 PREFIX=$(printf '%064x' $SRC_CHAIN); DEBRIDGE_ID=$(cast keccak "0x${PREFIX}${TOKEN_SRC#0x}")
 cast send "$TOKEN_SRC" "mint(address,uint256)" $ACC0 900000000000000000000 --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
@@ -119,7 +121,7 @@ EOF
 }
 write_vcfg "$ROOT/val1-gql.toml" "$V1K" "$LOGS/val1-gql-state.json"
 write_vcfg "$ROOT/val2-gql.toml" "$V2K" "$LOGS/val2-gql-state.json"
-cat > "$ROOT/keeper-gql.toml" <<EOF
+cat > "$LOGS/keeper-gql.toml" <<EOF
 [target]
 chain_id = $DST_CHAIN
 rpc = "$DST_RPC"
@@ -134,7 +136,7 @@ url = "$STORE_URL"
 EOF
 "$ROOT/target/debug/validator" "$ROOT/val1-gql.toml" >"$LOGS/val1-gql.log" 2>&1 & track $!
 "$ROOT/target/debug/validator" "$ROOT/val2-gql.toml" >"$LOGS/val2-gql.log" 2>&1 & track $!
-"$ROOT/target/debug/keeper"    "$ROOT/keeper-gql.toml" >"$LOGS/keeper-gql.log" 2>&1 & track $!
+"$ROOT/target/debug/keeper"    "$LOGS/keeper-gql.toml" >"$LOGS/keeper-gql.log" 2>&1 & track $!
 sleep 1
 
 echo "=== boot graphql-api against the LIVE sig-store (remote backend) ==="

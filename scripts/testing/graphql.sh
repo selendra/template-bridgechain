@@ -94,10 +94,25 @@ echo "=== Q4: mutation trust boundary rejects a forged record ==="
 # trust boundary as the sig-store, not just shape validation.
 SID="0x$(printf '0%.0s' {1..63})1"          # 32-byte hash, value 1
 DID="0x$(printf 'de%.0s' {1..32})"          # 32-byte hash, all 0xde
-OUT=$(gql "mutation { submitSignature(input:{submissionId:\"$SID\", debridgeId:\"$DID\", amount:\"100\", chainIdFrom:1337, chainIdTo:1338, nonce:9, receiver:\"0xcccc000000000000000000000000000000000003\", autoParams:\"0x\", nativeSender:\"0x\", signer:\"0xaaaa000000000000000000000000000000000001\", signature:\"0x01\"}) { submissionId } }")
+DOM="0x$(printf 'a1%.0s' {1..32})"          # 32-byte deployment domain
+# bridgeDomain is a REQUIRED input field (it is part of the submissionId
+# preimage). Omitting it makes the server reject at schema validation, BEFORE
+# the trust boundary runs — which is how this assertion silently went vacuous:
+# it saw "rejected" and passed without ever exercising the id<->params check.
+# Supply a well-formed value so the rejection has to come from the recompute.
+OUT=$(gql "mutation { submitSignature(input:{submissionId:\"$SID\", bridgeDomain:\"$DOM\", debridgeId:\"$DID\", amount:\"100\", chainIdFrom:1337, chainIdTo:1338, nonce:9, receiver:\"0xcccc000000000000000000000000000000000003\", autoParams:\"0x\", nativeSender:\"0x\", signer:\"0xaaaa000000000000000000000000000000000001\", signature:\"0x01\"}) { submissionId } }")
 echo "$OUT"
 echo "$OUT" | grep -qi 'does not match\|recomputed' || fail "mutation should have rejected on id<->params mismatch"
+echo "$OUT" | grep -qi 'is required but not provided' && fail "rejected at schema validation, not at the trust boundary"
 echo "✅ mutation rejected: submissionId != keccak(params) (id<->params binding holds)"
+
+echo
+echo "=== Q5: bridgeDomain is part of the id preimage, not optional decoration ==="
+# Same record, domain omitted -> the schema itself must refuse it. This pins the
+# field as required, so the check above can never silently go vacuous again.
+OUT=$(gql "mutation { submitSignature(input:{submissionId:\"$SID\", debridgeId:\"$DID\", amount:\"100\", chainIdFrom:1337, chainIdTo:1338, nonce:9, receiver:\"0xcccc000000000000000000000000000000000003\", autoParams:\"0x\", nativeSender:\"0x\", signer:\"0xaaaa000000000000000000000000000000000001\", signature:\"0x01\"}) { submissionId } }")
+echo "$OUT" | grep -qi 'bridgeDomain' || fail "omitting bridgeDomain should be refused by the schema"
+echo "✅ bridgeDomain is required by the schema"
 
 echo
 echo "================= RESULT ================="

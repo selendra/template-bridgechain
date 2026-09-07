@@ -10,6 +10,7 @@
 set -euo pipefail
 
 export PATH="$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
+source "$(dirname "${BASH_SOURCE[0]}")/_deploy_gate.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
@@ -73,12 +74,16 @@ forge build >/dev/null
 
 deploy_one() {  # $1 rpc, $2 label, $3 TOKEN|GATE
   local rpc=$1 label=$2 kind=$3 out addr
+  # Gate is UUPS — an implementation plus a GateProxy that runs
+  # initialize(). The old single `forge create Gate --constructor-args`
+  # form no longer compiles against it. See _deploy_gate.sh.
+  if [[ "$kind" == "GATE" ]]; then
+    deploy_gate "$rpc" "$KEY0" "[$VALIDATOR]" 1
+    return
+  fi
   if [[ "$kind" == "TOKEN" ]]; then
     out=$(forge create src/TestToken.sol:TestToken --rpc-url "$rpc" --private-key $KEY0 \
           --broadcast --json --constructor-args Test TST 2>"$LOGS/deploy-$label-err.log")
-  else
-    out=$(forge create src/Gate.sol:Gate --rpc-url "$rpc" --private-key $KEY0 \
-          --broadcast --json --constructor-args "[$VALIDATOR]" 1 2>"$LOGS/deploy-$label-err.log")
   fi
   echo "$out" > "$LOGS/deploy-$label.log"
   addr=$(echo "$out" | deployed_to || true)
@@ -113,7 +118,7 @@ cast send "$GATE_A" "setLocalToken(bytes32,address)" "$DEBRIDGE_C" "$TOKEN_A" --
 
 echo "=== writing configs: ONE validator with two [[sources]] + one keeper -> A ==="
 rm -f "$LOGS"/ms-*-state.json
-cat > "$ROOT/validator.toml" <<EOF
+cat > "$LOGS/validator.toml" <<EOF
 [[sources]]
 chain_id = $B_CHAIN
 rpc = "$B_RPC"
@@ -150,7 +155,7 @@ bind = "$API"
 allow_unauthenticated = true
 EOF
 
-cat > "$ROOT/keeper.toml" <<EOF
+cat > "$LOGS/keeper.toml" <<EOF
 [[targets]]
 chain_id = $A_CHAIN
 rpc = "$A_RPC"
@@ -165,9 +170,9 @@ dir = "$STORE"
 EOF
 
 echo "=== starting ONE multi-source validator + one keeper (->A) ==="
-"$ROOT/target/debug/validator" "$ROOT/validator.toml" >"$LOGS/val-ms.log" 2>&1 &
+"$ROOT/target/debug/validator" "$LOGS/validator.toml" >"$LOGS/val-ms.log" 2>&1 &
 VAL_PID=$!
-"$ROOT/target/debug/keeper" "$ROOT/keeper.toml" >"$LOGS/keeper.log" 2>&1 &
+"$ROOT/target/debug/keeper" "$LOGS/keeper.toml" >"$LOGS/keeper.log" 2>&1 &
 KEEPER_PID=$!
 
 # wait for the operator API to come up

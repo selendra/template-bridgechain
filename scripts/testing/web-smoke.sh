@@ -10,8 +10,13 @@
 # Run from anywhere:  bash scripts/testing/web-smoke.sh
 set -euo pipefail
 
-# Native Linux node (nvm) — the Windows node on PATH can't handle WSL paths.
-export PATH="$HOME/.nvm/versions/node/v25.9.0/bin:$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
+# Native Linux node (nvm). Pick the newest installed version rather than pinning
+# one: a hardcoded path silently vanishes on the next `nvm install`, and then
+# PATH falls back to whatever `node` the shell has — often none at all, which
+# surfaces as a confusing "command not found" deep inside the run. Same
+# auto-detect idiom as scripts/run.sh.
+NODE_BIN="${NODE_BIN:-$(ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -V | tail -1 || true)}"
+export PATH="${NODE_BIN:+$NODE_BIN:}$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WEB="$ROOT/frontend"
@@ -22,11 +27,25 @@ STORE="$BASE/store"; mkdir -p "$STORE"
 
 API_PID=""; WEB_PID=""
 cleanup() {
-  [[ -n "$WEB_PID" ]] && kill "$WEB_PID" 2>/dev/null || true
+  # `bunx vite` is a SHELL -> bunx -> node chain, so killing the pid we backgrounded
+  # reaps the wrapper and orphans the node process actually holding $WEB_PORT.
+  # A leaked server is worse than an untidy one here: the next run's `--strictPort`
+  # vite exits, curl still gets an answer from the STALE server, and the suite
+  # reports on a proxy pointed somewhere else entirely. So kill the process GROUP
+  # (see the setsid below), then make sure the port is really free.
+  [[ -n "$WEB_PID" ]] && kill -- -"$WEB_PID" 2>/dev/null || true
   [[ -n "$API_PID" ]] && kill "$API_PID" 2>/dev/null || true
+  command -v fuser >/dev/null 2>&1 && fuser -k "$WEB_PORT/tcp" 2>/dev/null || true
   rm -rf "$BASE"
 }
 trap cleanup EXIT
+
+# Refuse to run against someone else's server. Without this the suite silently
+# grades a process it did not start (and did not seed).
+if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$WEB_PORT/" 2>/dev/null; then
+  echo "❌ port $WEB_PORT is already serving — stop it first (this test must own it)" >&2
+  exit 1
+fi
 
 fail() {
   echo "❌ FAIL: $1"
@@ -63,7 +82,13 @@ echo "=== install web deps (if needed) ==="
 [[ -d "$WEB/node_modules/vite" ]] || ( cd "$WEB" && bun install >/dev/null 2>&1 ) || fail "bun install failed"
 
 echo "=== boot vite dev server (proxy -> $API_BIND) ==="
-( cd "$WEB" && GRAPHQL_API_URL="http://$API_BIND" bunx vite --port "$WEB_PORT" --strictPort >"$BASE/web.log" 2>&1 ) & WEB_PID=$!
+# VITE_PROXY_TARGET is the name vite.config.ts actually reads. This used to
+# say GRAPHQL_API_URL, which vite ignores — so the proxy fell back to its
+# default :8088 and this "hermetic" test quietly queried whatever stack was
+# already running, seeded store and all assertions notwithstanding.
+# setsid puts vite in its own process group so cleanup can kill the whole
+# chain (bunx + node), not just the wrapper.
+setsid bash -c "cd '$WEB' && VITE_PROXY_TARGET='http://$API_BIND' exec bunx vite --port $WEB_PORT --strictPort" >"$BASE/web.log" 2>&1 & WEB_PID=$!
 for i in $(seq 1 60); do curl -s "http://127.0.0.1:$WEB_PORT/" >/dev/null 2>&1 && break; sleep 0.3; done
 
 echo

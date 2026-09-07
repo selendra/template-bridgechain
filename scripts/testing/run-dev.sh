@@ -10,7 +10,13 @@
 # UI still runs.
 set -euo pipefail
 
-export PATH="$HOME/.nvm/versions/node/v25.9.0/bin:$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
+# Native Linux node (nvm). Pick the newest installed version rather than pinning
+# one: a hardcoded path silently vanishes on the next `nvm install`, and then
+# PATH falls back to whatever `node` the shell has — often none at all, which
+# surfaces as a confusing "command not found" deep inside the run. Same
+# auto-detect idiom as scripts/run.sh.
+NODE_BIN="${NODE_BIN:-$(ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -V | tail -1 || true)}"
+export PATH="${NODE_BIN:+$NODE_BIN:}$HOME/.foundry/bin:$HOME/.cargo/bin:$PATH"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONTRACTS="$ROOT/contracts"
 LOG=/tmp/bridge-run
