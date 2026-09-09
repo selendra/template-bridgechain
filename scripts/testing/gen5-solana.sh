@@ -115,11 +115,32 @@ configure)
   bash -c 'source scripts/gen5.config.local >/dev/null 2>&1
     source "'"$RUN_DIR"'/addresses.env"
     rpc(){ local w=$1 e c n r; for e in "${CHAINS[@]}"; do IFS="|" read -r c n r _ <<<"$e"; [ "${c// /}" = "$w" ] && { printf "%s" "${r// /}"; return; }; done; }
+    # M-3: every EVM gate must list the Solana chain id before an EVM->Solana
+    # `send` is accepted (run.config: EXTRA_SUPPORTED_CHAINS=('"$SOLANA_CHAIN_ID"')).
+    for c in 11155111 560048; do
+      g="CHAIN_${c}_GATE"; g="${!g:-}"; [ -n "$g" ] || continue
+      ok=$(cast call "$g" "supportedChain(uint256)(bool)" '"$SOLANA_CHAIN_ID"' --rpc-url "$(rpc "$c")" 2>/dev/null || echo false)
+      if [ "$ok" != "true" ]; then
+        cast send "$g" "setSupportedChain(uint256,bool)" '"$SOLANA_CHAIN_ID"' true --rpc-url "$(rpc "$c")" --private-key "$DEPLOYER_KEY" >/dev/null
+        echo "  chain $c gate: send -> Solana enabled"
+      fi
+    done
     cur=$(cast call "$CHAIN_11155111_GATE" "tokenOf(bytes32)(address)" "'"$DID"'" --rpc-url "$(rpc 11155111)")
     if [ "${cur,,}" = "0x0000000000000000000000000000000000000000" ]; then
-      cast send "$CHAIN_11155111_GATE" "setLocalToken(bytes32,address)" "'"$DID"'" "$TOKEN_TST_11155111" \
-        --rpc-url "$(rpc 11155111)" --private-key "$DEPLOYER_KEY" >/dev/null
-      echo "  Sepolia gate: tokenOf set -> $TOKEN_TST_11155111"
+      # H-1: on a sealed gate this is a governance action, not an instant call.
+      sealed=$(cast call "$CHAIN_11155111_GATE" "isSealed()(bool)" --rpc-url "$(rpc 11155111)" 2>/dev/null || echo false)
+      if [ "$sealed" = "true" ]; then
+        aid=$(cast call "$CHAIN_11155111_GATE" "setLocalTokenActionId(bytes32,address)(bytes32)" "'"$DID"'" "$TOKEN_TST_11155111" --rpc-url "$(rpc 11155111)")
+        echo "  !! Sepolia gate is SEALED — register the return path through governance:"
+        echo "     cast send $CHAIN_11155111_GATE '"'"'scheduleGovernance(bytes32)'"'"' $aid --rpc-url <sepolia> --private-key <owner>"
+        echo "     # after 48h (within 7d):"
+        echo "     cast send $CHAIN_11155111_GATE '"'"'setLocalToken(bytes32,address)'"'"' '"$DID"' $TOKEN_TST_11155111 --rpc-url <sepolia> --private-key <owner>"
+        echo "     (or add \"11155111|'"$DID"'|$TOKEN_TST_11155111\" to EXTRA_LOCAL_TOKENS before the next run.sh deploy)"
+      else
+        cast send "$CHAIN_11155111_GATE" "setLocalToken(bytes32,address)" "'"$DID"'" "$TOKEN_TST_11155111" \
+          --rpc-url "$(rpc 11155111)" --private-key "$DEPLOYER_KEY" >/dev/null
+        echo "  Sepolia gate: tokenOf set -> $TOKEN_TST_11155111"
+      fi
     else
       echo "  Sepolia gate: already mapped -> $cur"
     fi'

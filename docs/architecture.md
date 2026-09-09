@@ -149,7 +149,13 @@ One `Gate` per chain. It is both the source and the destination; the role depend
 | `refunded[submissionId]` | source | Refund replay guard. |
 | `executed[submissionId]` | destination | Spent here. Set by **both** `claim` and `cancel`. |
 | `cancelled[submissionId]` | destination | Distinguishes a burn from a delivery. |
-| `tokenOf[debridgeId]` | destination | Asset registry: which local ERC-20 backs this asset id. |
+| `tokenOf[debridgeId]` | destination | Asset registry: which local ERC-20 backs this asset id. Write-once. |
+| `supportedChain[chainId]` | source | Destinations `send` accepts (M-3). Unlisted ⇒ `UnsupportedChain`; nothing is locked towards a chain with no gate. Instant and reversible; `claim`/`cancel`/`refund` never consult it. |
+| `isSealed` | both | Ends the setup phase (H-1). Until `seal()`, the owner registers corridors instantly; after it, every new `setLocalToken` needs `scheduleGovernance(setLocalTokenActionId(id, token))` + `GOVERNANCE_DELAY`, so a stolen owner key cannot point a corridor at a worthless token and drain the pot. Irreversible. |
+
+`send` additionally reverts `AmountTooWide` when the receiver is 32 bytes (a Solana account) and `amount > 2^64-1`: the Solana gate's claim and cancel carry a `u64`, so a wider transfer could be neither delivered nor refunded (H-3). The frontend mirrors the check.
+
+Wiring order for every gate, before it is funded: `setSupportedChain` for each peer → `setLocalToken` for each inbound corridor → `seal()`. Both launchers do this and verify it.
 
 The `executed` / `cancelled` split is a sharp edge worth internalising.
 `executed` means "spent", not "delivered".
@@ -192,7 +198,7 @@ Every caller must sort signatures by recovered signer address ascending.
 Only `owner` may `unpause`.
 The guardian is deliberately low-trust: it can stop the bridge but never start it and never move funds, so a compromised guardian causes a denial of service and nothing worse.
 
-> **Operational note.** `setGuardian` is not called by any deploy path in this repository, so `guardian` is `address(0)` by default and only `owner` can trip the breaker. Set it as part of deployment.
+> **Operational note.** `DeployProd` (the `production` profile of `scripts/deploy-from-json.sh`) appoints the guardian and reverts if it is zero or equal to the owner. The `local` profile leaves it optional, which is one reason that profile is refused on any non-dev chain id.
 
 ### 3.2 SwapPool
 
@@ -527,8 +533,9 @@ The files in `docker/configs/` contain anvil's well-known development keys, whic
 `.dockerignore` now excludes them from the build context, but the pattern is still wrong: `SignerConfig` supports an encrypted keystore and an env var, and a real key should use one of those rather than the file.
 See `docs/operations.md` for the key-custody options.
 
-The sig-store bearer token comes from `SIG_STORE_TOKEN` and defaults to `dev-local-bridge-token` in compose.
-Override it.
+The sig-store takes one scoped bearer token per role (`SIG_STORE_{VALIDATOR,KEEPER,READER,ADMIN}_TOKEN`) and **fails closed** without them; both launchers generate random ones per run into `RUN_DIR/tokens.env`, alongside the random Postgres password (the container is bound to `127.0.0.1`).
+
+**RPC urls are credentials.** The chain registry the GraphQL API serves carries two urls per chain: `rpc_url` (what the services dial; may embed a provider key) and `public_rpc_url` (keyless, what a browser may use). The API serves only the latter — `null` when unset, and the UI falls back to the wallet's provider — and registers gates (EVM and Solana, told apart by address form) and swap pools (`swap_pool`) from the registry file rather than from `--gate` / `--swap` argv, so a keyed url never sits on a command line. The generated compose stacks reference urls as `${RPC_<chain>}` from a gitignored `.env`.
 
 ---
 

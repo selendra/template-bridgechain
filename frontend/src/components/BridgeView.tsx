@@ -2,10 +2,11 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Dropdown, type DropdownOption } from "./Dropdown";
 import { TxBanner, type TxState } from "./TxBanner";
 import { ArrowRight, Glyph, Help } from "./icons";
-import { chainViz, formatUnits, formatUnitsRaw, isAddress, parseUnits, shortHex, receiverProblem } from "../data/format";
+import { chainViz, formatUnits, formatUnitsRaw, isAddress, isSolanaAccount, parseUnits, shortHex, receiverProblem } from "../data/format";
 import { fetchSubmission, fetchSwapPool, fetchSwapQuote } from "../api/client";
 import { useDebounced, usePoll } from "../api/hooks";
 import {
+  U64_MAX,
   encodeAutoParamsTo,
   encodeSwapIntent,
   errMsg,
@@ -31,7 +32,10 @@ const eqAddr = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 const SLIPPAGE_OPTS = [10, 50, 100]; // bps: 0.1%, 0.5%, 1%
 
 /** A registry entry with no EVM RPC is a non-EVM chain — today, Solana. */
-const isNonEvmChain = (c: Chain) => !c.rpcUrl && !c.gate;
+// The registry tells the VMs apart by address form: an EVM gate is `0x…`, a
+// Solana gate is its base58 program id. A row with neither url nor gate (the
+// older "listed, not polled" form) is Solana too.
+const isNonEvmChain = (c: Chain) => (c.gate ? !c.gate.startsWith("0x") : !c.rpcUrl);
 
 interface Props {
   chains: Chain[];
@@ -307,6 +311,11 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
   const amountBase = tokenOk && !onchainStale ? parseUnits(amount, decimals) : 0n;
   const needsApprove = allowance != null && amountBase > 0n && spenderOk && allowance < amountBase;
   const insufficient = balance != null && amountBase > balance;
+  // H-3: a 32-byte (Solana) receiver can only ever claim a u64 amount — the
+  // Gate reverts AmountTooWide above 2^64-1, and anything that slipped past it
+  // would be locked forever. Same check here, so the button says why.
+  const solanaReceiver = receiverOk && !isAddress(receiver) && isSolanaAccount(receiver);
+  const amountTooWide = solanaReceiver && amountBase > U64_MAX;
   const busy = tx.kind === "pending";
 
   // --- cross-chain swap: quote both legs (source swap, destination swap) ----
@@ -590,6 +599,7 @@ export function BridgeView({ chains, wallet, solana, onReview }: Props) {
   // previous one — refuse to encode an amount with it rather than guess.
   else if (onchainStale) button = { label: "Reading token…", disabled: true };
   else if (amountBase <= 0n) button = { label: "Enter an amount", disabled: true };
+  else if (amountTooWide) button = { label: "Amount too large for a Solana receiver (max 2^64-1 base units)", disabled: true };
   else if (insufficient) button = { label: "Insufficient balance", disabled: true };
   else if (crossSwap && !corridorOk) button = { label: "Corridor not configured", disabled: true };
   else if (crossSwap && destExceedsLock) button = { label: "Exceeds destination pool lock", disabled: true };

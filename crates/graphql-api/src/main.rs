@@ -75,16 +75,23 @@ struct Args {
     #[arg(long = "gate", value_name = "CHAINID=RPC,GATE")]
     gates: Vec<String>,
     /// JSON file listing the network registry served to the UI via the `chains`
-    /// query (an array of {chain_id,name,rpc_url?,gate?,token?,router?} — snake_case,
-    /// matching ChainInfo's serde field names). Each chain with a rpc_url+gate is
-    /// also registered for `executed()` lookups (an explicit `--gate` for the same
-    /// chain wins). Omit it => `chains` returns `[]`.
+    /// query (an array of {chain_id,name,rpc_url?,public_rpc_url?,gate?,token?,
+    /// tokens?,router?,swap_pool?} — snake_case, matching ChainInfo's serde field
+    /// names). `rpc_url` is used server-side only (it may carry a provider key);
+    /// `public_rpc_url` is what clients receive as `rpcUrl`. Each chain with a
+    /// rpc_url+gate is also registered for `executed()` lookups — a base58 gate
+    /// as a Solana gate — and each with a rpc_url+swap_pool for the pool views
+    /// (`swap_pool` is `"ADDR"` or `{"address","from_block","max_block_range"}`).
+    /// An explicit `--gate`/`--swap` for the same chain wins. Omit it =>
+    /// `chains` returns `[]`.
     #[arg(long = "chains-file", env = "GRAPHQL_CHAINS_FILE", value_name = "PATH")]
     chains_file: Option<String>,
     /// Same-chain SwapPool(s) for the `pools`/`swapQuote` read view, as
-    /// `CHAINID=RPC,POOL` (repeatable), e.g.
-    /// `--swap 1337=http://127.0.0.1:8545,0xPool...`. Without it, `pools` and
-    /// `swapQuote` return null. Read-only — no swaps are executed server-side.
+    /// `CHAINID=RPC,POOL[,FROM_BLOCK[,MAX_RANGE]]` (repeatable), e.g.
+    /// `--swap 1337=http://127.0.0.1:8545,0xPool...`. Prefer the registry's
+    /// `swap_pool` key (keeps the RPC url off argv); this flag remains as a
+    /// fallback and wins for its chain. Without either, `pools` and `swapQuote`
+    /// return null. Read-only — no swaps are executed server-side.
     #[arg(long = "swap", value_name = "CHAINID=RPC,POOL")]
     swaps: Vec<String>,
     /// Expose the `submitSignature` mutation (off by default — read-only).
@@ -108,6 +115,13 @@ struct Args {
     /// Largest accepted request body, in bytes.
     #[arg(long, env = "GRAPHQL_MAX_BODY_BYTES", default_value_t = 128 * 1024)]
     max_body_bytes: usize,
+    /// Query complexity cap. List fields multiply by their page size and each
+    /// chain-reading field (`executed`/`cancelled`/`status`) costs
+    /// `schema::CHAIN_READ_COST` (20), so this bounds `eth_call` fan-out per
+    /// request at roughly `max_complexity / 20`. The default admits a full
+    /// 200-row page with `status`, and refuses one asking for all three.
+    #[arg(long, env = "GRAPHQL_MAX_COMPLEXITY", default_value_t = 8000)]
+    max_complexity: usize,
 }
 
 #[tokio::main]
@@ -144,12 +158,32 @@ async fn main() -> anyhow::Result<()> {
         Some(path) => chain::load_registry(path)?,
         None => Vec::new(),
     };
+    // H-4: the `chains` query serves `public_rpc_url` as `rpcUrl` and NEVER the
+    // (possibly keyed) `rpc_url`. A chain without a public one is served with
+    // `rpcUrl: null` — legal, the UI falls back to the wallet — but worth a
+    // warning per chain, and a refusal under --production where a null means
+    // the operator has simply not finished the migration.
+    let unpublished = chain::chains_without_public_rpc(&registry);
+    for id in &unpublished {
+        warn!(
+            chain_id = id,
+            "chain has no `public_rpc_url` in the registry: `chains.rpcUrl` will be null for it              (the private `rpc_url` is never served)"
+        );
+    }
+    if args.production && !unpublished.is_empty() {
+        anyhow::bail!(
+            "--production: every chain in the registry needs a `public_rpc_url` (a keyless              endpoint safe to hand to browsers); missing for chain ids {unpublished:?}"
+        );
+    }
+    // Base58 gates route to the Solana reader here (`Chains::add`), so the
+    // Solana leg no longer needs its RPC on `--gate` argv either.
     for c in &registry {
         if let (Some(rpc), Some(gate)) = (&c.rpc_url, &c.gate) {
             chains.add(c.chain_id, rpc, gate)?;
         }
     }
     let chain_ids = chains.configured();
+    let solana_ids = chains.configured_solana();
 
     let mut swaps = Swaps::new();
     // Hosted RPCs cap eth_getLogs and reject anything wider (Alchemy free tier:
@@ -159,6 +193,11 @@ async fn main() -> anyhow::Result<()> {
     }
     for spec in &args.swaps {
         swaps.add_spec(spec)?;
+    }
+    // File form: a registry entry's `swap_pool`, read over its `rpc_url`. argv
+    // above already claimed its chains, so those entries are no-ops.
+    for c in &registry {
+        swaps.add_from_registry(c)?;
     }
     // An SPL mint has no on-chain symbol (it lives in Metaplex metadata), so a
     // Solana pool takes its token names from the same registry the UI reads.
@@ -198,7 +237,7 @@ async fn main() -> anyhow::Result<()> {
     let mut router = if args.allow_mutations {
         let mut schema = Schema::build(Query, Mutation, async_graphql::EmptySubscription)
             .limit_depth(15)
-            .limit_complexity(1000)
+            .limit_complexity(args.max_complexity)
             .data(state);
         if args.production {
             schema = schema.disable_introspection();
@@ -214,7 +253,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         let mut schema = Schema::build(Query, EmptyMutation, async_graphql::EmptySubscription)
             .limit_depth(15)
-            .limit_complexity(1000)
+            .limit_complexity(args.max_complexity)
             .data(state);
         if args.production {
             schema = schema.disable_introspection();
@@ -230,10 +269,9 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if args.production {
-        warn!(
-            "production mode: GraphiQL and introspection are OFF. Note the `chains` \
-             query still returns each network's rpc_url verbatim — never put a \
-             provider API key in the chains registry."
+        info!(
+            "production mode: GraphiQL and introspection are OFF; the `chains` query serves \
+             only `public_rpc_url` (never the server-side `rpc_url`)."
         );
     }
 
@@ -257,6 +295,7 @@ async fn main() -> anyhow::Result<()> {
         threshold = ?args.threshold,
         mutations = args.allow_mutations,
         on_chain_status_for = ?chain_ids,
+        solana_gates_for = ?solana_ids,
         swap_pools_for = ?swap_ids,
         production = args.production,
         // History lives behind the sig-store's read scope, so a dir-backed run

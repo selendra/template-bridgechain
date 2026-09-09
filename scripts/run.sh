@@ -32,21 +32,42 @@ if [[ -z "${NODE_BIN:-}" ]]; then
 fi
 export PATH="${NODE_BIN:+$NODE_BIN:}${FOUNDRY_BIN:-}:${CARGO_BIN:-}:$PATH"
 
-RUN_DIR="${RUN_DIR:-/tmp/bridge-run}"
-mkdir -p "$RUN_DIR"
+# Not /tmp (M-11, audit round 4): the run dir holds validator/keeper private keys
+# in the generated TOMLs, the sig-store tokens and the Postgres password, and
+# `systemd-tmpfiles-clean` sweeps /tmp daily — which also loses the validator
+# cursors. Everything written here is created 0600 under a 0700 directory.
+RUN_DIR="${RUN_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/selendra-bridge/run}"
+umask 077
+mkdir -p "$RUN_DIR" "$RUN_DIR/pids"
+chmod 700 "$RUN_DIR"
 ADDR_ENV="$RUN_DIR/addresses.env"     # generated deploy addresses (for the summary + reruns)
 REG_JSON="$RUN_DIR/chains.json"       # generated registry the frontend reads via graphql
+TOKENS_ENV="$RUN_DIR/tokens.env"      # sig-store tokens + Postgres password, 0600
 
 STORE_URL="http://$BIND_HOST:$STORE_PORT"
 GQL_BIND="$BIND_HOST:$GQL_PORT"
 
 say()  { printf '\n\033[1;36m=== %s ===\033[0m\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
+warn() { printf '\033[1;33m  ! %s\033[0m\n' "$*"; }
 die()  { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
 # Long-lived service, detached so it survives this shell. $1 command, $2 logfile.
-spawn() { setsid bash -c "exec $1" >"$RUN_DIR/$2" 2>&1 </dev/null & disown || true; }
+#
+# The pid is recorded by the process ITSELF (`$$` inside the setsid'd shell,
+# which then execs into the service), so the file names the real service pid
+# even when setsid had to fork. `stop.sh` kills exactly these process groups and
+# nothing else — no more `pkill -f vite` (audit round 4, LOW).
+spawn() {
+  local name="${2%.log}"
+  local pidfile="$RUN_DIR/pids/$name.pid"
+  printf '%s\n' "$1" > "$RUN_DIR/pids/$name.cmd"
+  setsid bash -c "echo \$\$ > '$pidfile'; exec $1" >"$RUN_DIR/$2" 2>&1 </dev/null & disown || true
+}
 need()  { command -v "$1" >/dev/null 2>&1 || die "'$1' not found on PATH (needed for: $2)"; }
+rand_token() { openssl rand -hex 32 2>/dev/null || head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+# Read one KEY from a previous run's tokens file (empty if absent).
+prev_token() { [[ -f "$TOKENS_ENV" ]] && sed -n "s/^$1=//p" "$TOKENS_ENV" | head -1 || true; }
 
 (( BASH_VERSINFO[0] >= 4 )) || die "bash 4+ required (found $BASH_VERSION); the ASSETS map needs associative arrays"
 
@@ -69,6 +90,39 @@ for entry in "${CHAINS[@]}"; do
   CIDX[$cid]=${#CID[@]}
   CID+=("$cid"); CNAME+=("${cname:-chain $cid}"); CRPC+=("$crpc"); CGATE+=("$cgate")
 done
+
+# Browser-facing RPC per chain (H-4, audit round 4). The registry the GraphQL API
+# serves to every anonymous client used to carry the SAME url the services use —
+# and on a hosted provider that url IS the API key. The API now serves only
+# `public_rpc_url` (as `rpcUrl`, or null), never `rpc_url`.
+#
+#   PUBLIC_RPCS[chain_id]="https://…"   keyless endpoint safe to hand to browsers
+#
+# Unset: a loopback/anvil url is its own public url (nothing to leak); anything
+# else gets NO public url — the UI falls back to the wallet's provider for its
+# reads — and a warning, so a live chain is never served a key by accident.
+declare -A PUBLIC_RPCS 2>/dev/null || true
+is_local_rpc() { [[ "$1" =~ ^https?://(127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0)(:[0-9]+)?(/.*)?$ ]]; }
+public_rpc_for() {  # $1 chain_id, $2 private rpc -> echoes the public url or nothing
+  local cid="$1" rpc="$2"
+  if [[ -n "${PUBLIC_RPCS[$cid]:-}" ]]; then echo "${PUBLIC_RPCS[$cid]}"; return; fi
+  if is_local_rpc "$rpc"; then echo "$rpc"; return; fi
+  warn "chain $cid: no PUBLIC_RPCS[$cid] configured — the UI gets rpcUrl=null for it (the private endpoint is never served)"
+}
+
+# Destinations `send` may target beyond the EVM mesh itself (M-3: `send` reverts
+# UnsupportedChain for anything the owner has not listed). The Solana gate lives
+# in its own config, so its chain id goes here. Idempotent, instant, reversible.
+#   EXTRA_SUPPORTED_CHAINS=(7565164)
+# `+x` first: run.sh runs under `set -u`.
+[[ -n "${EXTRA_SUPPORTED_CHAINS+x}" ]] || EXTRA_SUPPORTED_CHAINS=()
+
+# seal() after wiring (H-1). Irreversible: from then on a NEW corridor needs
+# scheduleGovernance + 48h, which is what stops an owner key from draining the
+# gate through a fake corridor. `false` keeps the setup phase open — for a
+# throwaway anvil mesh you keep adding assets to, never for a gate that holds
+# anyone else's funds.
+SEAL_GATES="${SEAL_GATES:-true}"
 
 # Per-chain finality buffer. A confirmation COUNT means a different wall-clock
 # delay on every chain — 6 blocks is 12s on a 2s chain and 1.5s on Arbitrum's
@@ -288,13 +342,57 @@ else
   done
 fi
 
+# --- gate wiring helpers (audit round 4: H-1 seal, M-3 supportedChain) --------
+#
+# Order per gate, before any liquidity: setSupportedChain for every peer ->
+# setLocalToken for every inbound corridor -> seal(). Every step is idempotent
+# (read first, send only what is missing), so re-running is safe.
+gate_owner()     { cast call "$1" "owner()(address)" --rpc-url "$2" 2>/dev/null || echo ""; }
+gate_owned_by_us() { [[ "$(gate_owner "$1" "$2" | tr 'A-F' 'a-f')" == "${DEPLOYER_ADDR,,}" ]]; }
+gate_sealed()    { [[ "$(cast call "$1" "isSealed()(bool)" --rpc-url "$2" 2>/dev/null || echo false)" == "true" ]]; }
+chain_supported() { [[ "$(cast call "$1" "supportedChain(uint256)(bool)" "$3" --rpc-url "$2" 2>/dev/null || echo false)" == "true" ]]; }
+peers_of() {  # $1 array index -> every chain id this gate may `send` to
+  local i="$1" j x
+  for j in "${!CID[@]}"; do [[ "$j" == "$i" ]] || echo "${CID[$j]}"; done
+  for x in "${EXTRA_SUPPORTED_CHAINS[@]:-}"; do [[ -n "$x" ]] && echo "$x"; done
+}
+# Register an inbound corridor. setLocalToken is WRITE-ONCE (finding M-5): a
+# registered corridor cannot be repointed, because in-flight claims bind only the
+# debridgeId and would then release the new asset — so an existing mapping is
+# skipped, not re-sent. On a SEALED gate the owner can no longer register
+# instantly; print exactly what governance must do instead of a bare revert.
+register_corridor() {  # gate rpc debridgeId localToken label
+  local gate="$1" rpc="$2" did="$3" tok="$4" label="$5" cur aid
+  cur=$(cast call "$gate" "tokenOf(bytes32)(address)" "$did" --rpc-url "$rpc" 2>/dev/null || echo "")
+  if [[ -n "${cur:-}" && ! "${cur:-}" =~ ^0x0{40}$ ]]; then info "$label already registered ($cur)"; return; fi
+  if gate_sealed "$gate" "$rpc"; then
+    aid=$(cast call "$gate" "setLocalTokenActionId(bytes32,address)(bytes32)" "$did" "$tok" --rpc-url "$rpc")
+    die "$label: gate $gate is SEALED — a new corridor needs governance (H-1):
+    cast send $gate 'scheduleGovernance(bytes32)' $aid --rpc-url $rpc --private-key <owner>
+    # wait GOVERNANCE_DELAY (48h), then within SCHEDULE_GRACE (7d):
+    cast send $gate 'setLocalToken(bytes32,address)' $did $tok --rpc-url $rpc --private-key <owner>
+  (or SEAL_GATES=false on a throwaway mesh, and redeploy)"
+  fi
+  csend "$gate" "setLocalToken(bytes32,address)" "$did" "$tok" --rpc-url "$rpc" --private-key "$DEPLOYER_KEY"
+  info "$label -> $tok"
+}
+
+# --- 4b-i. destinations: every gate lists every peer it may send to (M-3) ---
+say "listing destinations (setSupportedChain)"
+for i in "${!CID[@]}"; do
+  for peer in $(peers_of "$i"); do
+    chain_supported "${CGATE[$i]}" "${CRPC[$i]}" "$peer" && continue
+    if gate_owned_by_us "${CGATE[$i]}" "${CRPC[$i]}"; then
+      csend "${CGATE[$i]}" "setSupportedChain(uint256,bool)" "$peer" true --rpc-url "${CRPC[$i]}" --private-key "$DEPLOYER_KEY"
+      info "${CNAME[$i]}: send -> chain $peer enabled"
+    else
+      warn "${CNAME[$i]}: chain $peer is not a supported destination and the deployer is not the gate owner ($(gate_owner "${CGATE[$i]}" "${CRPC[$i]}")) — the owner must call setSupportedChain($peer, true)"
+    fi
+  done
+done
+
 # Wire when anything fresh was deployed (extra liquidity is harmless on a test
 # chain). Skip entirely for a pure existing stack.
-#
-# setLocalToken is now WRITE-ONCE (finding M-5): a registered corridor cannot be
-# repointed, because in-flight claims bind only the debridgeId and would then
-# release the new asset. So re-running against an already-wired gate must SKIP
-# rather than re-send, or the call reverts LocalTokenAlreadySet.
 if [[ "$DEPLOY_BRIDGE" == "true" || "$DEPLOY_TOKENS" == "true" ]]; then
   say "wiring asset meshes (liquidity + setLocalToken)"
   for sym in "${ASYMS[@]}"; do
@@ -310,17 +408,79 @@ if [[ "$DEPLOY_BRIDGE" == "true" || "$DEPLOY_TOKENS" == "true" ]]; then
         [[ "$ocid" == "$cid" ]] && continue
         otok="${ATOKEN[$sym|$ocid]}"
         pad=$(printf '%064x' "$ocid"); did=$(cast keccak "0x${pad}${otok#0x}")
-        # Write-once: only register a corridor that is still unset.
-        cur=$(cast call "${CGATE[$i]}" "tokenOf(bytes32)(address)" "$did" --rpc-url "${CRPC[$i]}" 2>/dev/null || echo "")
-        if [[ "${cur:-}" =~ ^0x0{40}$ || -z "${cur:-}" ]]; then
-          csend "${CGATE[$i]}" "setLocalToken(bytes32,address)" "$did" "$tok" --rpc-url "${CRPC[$i]}" --private-key "$DEPLOYER_KEY"
-        else
-          info "corridor $sym <- chain $ocid already registered on chain $cid ($cur)"
-        fi
+        register_corridor "${CGATE[$i]}" "${CRPC[$i]}" "$did" "$tok" "corridor $sym <- chain $ocid on chain $cid"
       done
     done
   done
 fi
+
+# --- 4b-ii. return paths for corridors this script does NOT manage ---
+#
+# The loop above wires only the chains in CHAINS — i.e. the EVM mesh. A corridor
+# whose far side lives elsewhere (the Solana gate, which has its own config and
+# its own toolchain) therefore has no `tokenOf` mapping on the EVM side, and a
+# claim arriving from it reverts `UnknownAsset`.
+#
+# That failed SILENTLY and cost real debugging time: the keeper treats
+# `tokenOf == 0` as a stranded transfer and declines to retry, so the only
+# symptom was a fully-signed transfer parked at READY with nothing in any log.
+# (The keeper now reports it once at WARN — see `ClaimOutcome::Stranded` — but
+# the corridor still has to be registered, and registering it here means a
+# redeploy cannot forget.)
+#
+# Entries are "chain_id | debridgeId | local_token":
+#   chain_id     an EVM chain from CHAINS, whose gate gets the mapping
+#   debridgeId   the asset id the FAR side emits (keccak(origin_chain, origin_token))
+#   local_token  the ERC-20 this gate releases for it
+#
+# Write-once, like the mesh wiring above, so re-running is safe.
+# `+x` first: run.sh runs under `set -u`, and a bare ${#arr[@]} on an array no
+# config happens to define is an unbound-variable abort.
+if [[ -n "${EXTRA_LOCAL_TOKENS+x}" && ${#EXTRA_LOCAL_TOKENS[@]} -gt 0 ]]; then
+  say "registering return paths for externally-managed corridors"
+  for entry in "${EXTRA_LOCAL_TOKENS[@]}"; do
+    IFS='|' read -r xcid xdid xtok <<<"$entry"
+    xcid="${xcid// /}"; xdid="${xdid// /}"; xtok="${xtok// /}"
+    [[ -n "$xcid" && -n "$xdid" && -n "$xtok" ]] || die "bad EXTRA_LOCAL_TOKENS entry: '$entry'"
+    [[ -n "${CIDX[$xcid]:-}" ]] || die "EXTRA_LOCAL_TOKENS names chain $xcid, which is not in CHAINS"
+    [[ "$xdid" =~ ^0x[0-9a-fA-F]{64}$ ]] || die "EXTRA_LOCAL_TOKENS debridgeId must be 0x + 64 hex: '$xdid'"
+    i=${CIDX[$xcid]}
+    register_corridor "${CGATE[$i]}" "${CRPC[$i]}" "$xdid" "$xtok" "chain $xcid: ${xdid:0:12}…"
+  done
+fi
+
+# --- 4b-iii. seal (H-1) — the LAST wiring step, before anything is funded ---
+#
+# From here on every new corridor is scheduleGovernance + 48h. That is the
+# property that stops a stolen owner key from registering a worthless token as
+# the asset behind a real corridor and draining the pot in one block.
+if [[ "$SEAL_GATES" == "true" ]]; then
+  say "sealing gates (new corridors now need governance + 48h)"
+  for i in "${!CID[@]}"; do
+    if gate_sealed "${CGATE[$i]}" "${CRPC[$i]}"; then info "${CNAME[$i]}: already sealed"; continue; fi
+    if gate_owned_by_us "${CGATE[$i]}" "${CRPC[$i]}"; then
+      csend "${CGATE[$i]}" "seal()" --rpc-url "${CRPC[$i]}" --private-key "$DEPLOYER_KEY"
+      info "${CNAME[$i]}: sealed"
+    else
+      warn "${CNAME[$i]}: gate is UNSEALED and the deployer is not its owner — the owner must call seal() before funding it"
+    fi
+  done
+else
+  warn "SEAL_GATES=false: gates stay in the setup phase (setLocalToken instant). Dev only."
+fi
+
+# --- 4b-iv. assert the wiring, so a half-configured mesh never comes up ------
+say "verifying gate wiring"
+for i in "${!CID[@]}"; do
+  for peer in $(peers_of "$i"); do
+    chain_supported "${CGATE[$i]}" "${CRPC[$i]}" "$peer" \
+      || die "${CNAME[$i]} gate ${CGATE[$i]}: supportedChain($peer) is false — send towards it would revert UnsupportedChain"
+  done
+  if [[ "$SEAL_GATES" == "true" ]] && gate_owned_by_us "${CGATE[$i]}" "${CRPC[$i]}"; then
+    gate_sealed "${CGATE[$i]}" "${CRPC[$i]}" || die "${CNAME[$i]} gate ${CGATE[$i]} is not sealed"
+  fi
+  info "${CNAME[$i]}: peers ok, sealed=$(gate_sealed "${CGATE[$i]}" "${CRPC[$i]}" && echo true || echo false)"
+done
 
 # --- 4c. swap: same-chain SwapPool for the Swap view ---
 if [[ "$ENABLE_SWAP" == "true" ]]; then
@@ -398,14 +558,31 @@ if [[ "$PG_DOCKER" == "true" ]]; then
   # `bash scripts/stop.sh <config> --wipe` deletes the volume when a clean slate
   # is actually what you want.
   docker volume create "${PG_NAME}-data" >/dev/null 2>&1 || true
+  # M-10 (audit round 4): the port used to be published on every interface with
+  # `bridge:bridge` — a `-p` publish bypasses ufw, so signatures, refund state
+  # and allowlists were writable by anyone who could reach the host. Loopback
+  # only, and a random password: from PG_PASSWORD in the config if set, else the
+  # one this run dir already generated (it must match the volume's), else fresh.
+  PG_PASSWORD="${PG_PASSWORD:-$(prev_token PG_PASSWORD)}"
+  [[ -n "$PG_PASSWORD" ]] || PG_PASSWORD="$(rand_token)"
   docker run -d --name "$PG_NAME" \
-    -e POSTGRES_USER=bridge -e POSTGRES_PASSWORD=bridge -e POSTGRES_DB=bridge \
+    -e POSTGRES_USER=bridge -e POSTGRES_PASSWORD="$PG_PASSWORD" -e POSTGRES_DB=bridge \
     -v "${PG_NAME}-data:/var/lib/postgresql/data" \
-    -p "${PG_PORT}:5432" postgres:16-alpine >/dev/null || die "failed to start Postgres container"
+    -p "127.0.0.1:${PG_PORT}:5432" postgres:16-alpine >/dev/null || die "failed to start Postgres container"
   ok=false
   for _ in $(seq 1 60); do docker exec "$PG_NAME" pg_isready -U bridge -d bridge >/dev/null 2>&1 && { ok=true; break; }; sleep 0.5; done
   $ok || die "Postgres did not become ready"
-  info "Postgres ready"
+  # POSTGRES_PASSWORD only applies when the volume is first initialised. A volume
+  # from an earlier run (or from before this change, when the password was
+  # `bridge`) keeps its old one, so set it explicitly over the container's local
+  # socket (trust auth) — no more "password authentication failed" on upgrade.
+  docker exec "$PG_NAME" psql -q -U bridge -d bridge \
+    -c "ALTER USER bridge WITH PASSWORD '$PG_PASSWORD';" >/dev/null 2>&1 \
+    || warn "could not set the Postgres password on the existing volume"
+  DATABASE_URL="postgres://bridge:${PG_PASSWORD}@127.0.0.1:${PG_PORT}/bridge?sslmode=disable"
+  info "Postgres ready on 127.0.0.1:$PG_PORT (password in $TOKENS_ENV)"
+else
+  [[ -n "${DATABASE_URL:-}" ]] || die "PG_DOCKER=false needs DATABASE_URL in the config"
 fi
 
 # ---------------------------------------------------------------------------
@@ -420,11 +597,19 @@ fi
 # One random token per role per run, so a leak from one component cannot act as
 # another. Override any of them in the config to pin a value across restarts.
 # ---------------------------------------------------------------------------
-rand_token() { openssl rand -hex 32 2>/dev/null || head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 export SIG_STORE_VALIDATOR_TOKEN="${SIG_STORE_VALIDATOR_TOKEN:-$(rand_token)}"
 export SIG_STORE_KEEPER_TOKEN="${SIG_STORE_KEEPER_TOKEN:-$(rand_token)}"
 export SIG_STORE_READER_TOKEN="${SIG_STORE_READER_TOKEN:-$(rand_token)}"
 export SIG_STORE_ADMIN_TOKEN="${SIG_STORE_ADMIN_TOKEN:-$(rand_token)}"
+# Written before anything reads it (umask 077 is process-wide, see the top).
+{
+  echo "SIG_STORE_VALIDATOR_TOKEN=$SIG_STORE_VALIDATOR_TOKEN"
+  echo "SIG_STORE_KEEPER_TOKEN=$SIG_STORE_KEEPER_TOKEN"
+  echo "SIG_STORE_READER_TOKEN=$SIG_STORE_READER_TOKEN"
+  echo "SIG_STORE_ADMIN_TOKEN=$SIG_STORE_ADMIN_TOKEN"
+  [[ -n "${PG_PASSWORD:-}" ]] && echo "PG_PASSWORD=$PG_PASSWORD"
+} > "$TOKENS_ENV"
+chmod 600 "$TOKENS_ENV"
 
 say "starting sig-store ($STORE_URL)"
 SIG_STORE_BIND="$BIND_HOST:$STORE_PORT" DATABASE_URL="$DATABASE_URL" \
@@ -433,18 +618,24 @@ ok=false
 for _ in $(seq 1 60); do curl -s "$STORE_URL/health" | grep -q ok && { ok=true; break; }; sleep 0.25; done
 $ok || die "sig-store did not come up (see $RUN_DIR/sig-store.log)"
 info "sig-store healthy"
-info "auth: scoped tokens generated (admin token in $RUN_DIR/tokens.env)"
-umask 077; {
-  echo "SIG_STORE_VALIDATOR_TOKEN=$SIG_STORE_VALIDATOR_TOKEN"
-  echo "SIG_STORE_KEEPER_TOKEN=$SIG_STORE_KEEPER_TOKEN"
-  echo "SIG_STORE_READER_TOKEN=$SIG_STORE_READER_TOKEN"
-  echo "SIG_STORE_ADMIN_TOKEN=$SIG_STORE_ADMIN_TOKEN"
-} > "$RUN_DIR/tokens.env"
+info "auth: scoped tokens generated (admin token in $TOKENS_ENV)"
 
 # ---------------------------------------------------------------------------
 # 7. validators — watch ALL chains as sources; refund to ALL as destinations
 # ---------------------------------------------------------------------------
 say "starting ${#VALIDATOR_KEYS[@]} validator(s), each watching all $N chains"
+# Scan cursors (`validator-*-<chain>.json`) survive in the run dir on purpose:
+# on a LIVE chain a lost cursor means re-scanning from `start_block`. On a local
+# anvil the opposite holds — the chain was just re-created from block 0, so a
+# cursor from the previous run points PAST every block that will exist for a
+# long while, and the validators sit silently waiting for it: nothing is ever
+# signed, while the refund loop (which reads the chain directly) still works.
+# That is exactly what the durable run dir (M-11) made reproducible on every
+# re-run, so throwaway chains get throwaway cursors.
+if [[ "$LOCAL_ANVIL" == "true" ]]; then
+  stale=$(find "$RUN_DIR" -maxdepth 1 -name 'validator-*-*.json' -print -delete | wc -l)
+  (( stale == 0 )) || info "LOCAL_ANVIL: dropped $stale scan cursor(s) from the previous run (the chains restarted at block 0)"
+fi
 vi=0
 for key in "${VALIDATOR_KEYS[@]}"; do
   vi=$((vi+1))
@@ -539,6 +730,14 @@ fi
 # 10. graphql-api (backend) — registry + gates for ALL chains
 # ---------------------------------------------------------------------------
 say "starting graphql-api ($GQL_BIND)"
+# The pool's token list is discovered by replaying its TokenListed logs, so its
+# scan floor must be AT OR BEFORE the pool's deployment — always. That is a
+# different requirement from the scanners' floor, which is "this deployment's
+# history onward" and legitimately moves forward over time. Deriving one from the
+# other silently empties the token list the moment they diverge: the scan starts
+# after the listings, finds nothing, and the Swap view renders a pool with zero
+# tokens. Hence its own knob, defaulting to the chain's floor.
+: "${SWAP_FROM_BLOCK:=$(start_block_for "$SWAP_CHAIN" "${CRPC[$swap_idx]}")}"
 {
   echo "["
   for i in "${!CID[@]}"; do
@@ -551,27 +750,29 @@ say "starting graphql-api ($GQL_BIND)"
       [[ -n "$toks" ]] && toks+=", "
       toks+="{\"symbol\": \"$sym\", \"address\": \"$t\"}"
     done
-    echo "  {\"chain_id\": ${CID[$i]}, \"name\": \"${CNAME[$i]}\", \"rpc_url\": \"${CRPC[$i]}\", \"gate\": \"${CGATE[$i]}\", \"token\": \"${CTOKEN[$i]}\", \"tokens\": [$toks]}$sep"
+    # `rpc_url` is what the API itself calls (server-side, may carry a key);
+    # `public_rpc_url` is the only one it ever serves to a browser (H-4).
+    pub="$(public_rpc_for "${CID[$i]}" "${CRPC[$i]}")"
+    pubf=""; [[ -n "$pub" ]] && pubf=", \"public_rpc_url\": \"$pub\""
+    # The swap pool rides in the registry too (`swap_pool`, read over this
+    # entry's rpc_url), so no RPC url has to go on the API's command line.
+    poolf=""
+    if [[ "$ENABLE_SWAP" == "true" && $i == "$swap_idx" && -n "${SWAP_POOL:-}" ]]; then
+      poolf=", \"swap_pool\": {\"address\": \"$SWAP_POOL\", \"from_block\": $SWAP_FROM_BLOCK, \"max_block_range\": $MAX_BLOCK_RANGE}"
+    fi
+    echo "  {\"chain_id\": ${CID[$i]}, \"name\": \"${CNAME[$i]}\", \"rpc_url\": \"${CRPC[$i]}\"$pubf, \"gate\": \"${CGATE[$i]}\", \"token\": \"${CTOKEN[$i]}\", \"tokens\": [$toks]$poolf}$sep"
   done
   echo "]"
 } > "$REG_JSON"
 
+# No `--gate` / `--swap` flags: the API folds every registry chain's gate and
+# `swap_pool` into its maps itself, so the keyed RPC urls stay in the 0600
+# chains.json instead of on a world-readable command line (/proc/*/cmdline).
 GQL_ARGS=(--bind "$GQL_BIND" --store-url "$STORE_URL" --threshold "$THRESHOLD"
           --chains-file "$REG_JSON" --allow-mutations)
-for i in "${!CID[@]}"; do GQL_ARGS+=(--gate "${CID[$i]}=${CRPC[$i]},${CGATE[$i]}"); done
 # No --db-url: graphql-api reads the indexer's history through the sig-store's
 # Read scope, on the reader token it already holds. It is the only service meant
 # to face the internet, so it gets no database credential of its own.
-# The pool's token list is discovered by replaying its TokenListed logs, so its
-# scan floor must be AT OR BEFORE the pool's deployment — always. That is a
-# different requirement from the scanners' floor, which is "this deployment's
-# history onward" and legitimately moves forward over time. Deriving one from the
-# other silently empties the token list the moment they diverge: the scan starts
-# after the listings, finds nothing, and the Swap view renders a pool with zero
-# tokens. Hence its own knob, defaulting to the chain's floor.
-: "${SWAP_FROM_BLOCK:=$(start_block_for "$SWAP_CHAIN" "${CRPC[$swap_idx]}")}"
-[[ "$ENABLE_SWAP" == "true" && -n "${SWAP_POOL:-}" ]] && \
-  GQL_ARGS+=(--swap "$SWAP_CHAIN=${CRPC[$swap_idx]},$SWAP_POOL,$SWAP_FROM_BLOCK")
 
 export GRAPHQL_MAX_BLOCK_RANGE="$MAX_BLOCK_RANGE"
 spawn "$ROOT/target/debug/graphql-api ${GQL_ARGS[*]}" graphql-api.log
@@ -602,13 +803,14 @@ for i in "${!CID[@]}"; do
   for sym in "${ASYMS[@]}"; do
     t="${ATOKEN[$sym|${CID[$i]}]:-}"; [[ -n "$t" ]] && toks+="$sym "
   done
-  printf '  %-12s %s\n' "${CNAME[$i]}" "${CRPC[$i]}   gate ${CGATE[$i]}"
+  # never echo a keyed url: a terminal scrollback is a log too
+  shown="${CRPC[$i]}"; is_local_rpc "$shown" || shown="${PUBLIC_RPCS[${CID[$i]}]:-<private rpc, see $CONFIG>}"
+  printf '  %-12s %s\n' "${CNAME[$i]}" "$shown   gate ${CGATE[$i]}"
   printf '  %-12s   assets: %s\n' "" "${toks:-none}"
 done
 echo
 echo "  MetaMask: add each network above, then import the deployer to move funds:"
-echo "    address $DEPLOYER_ADDR"
-echo "    key     $DEPLOYER_KEY"
+echo "    address $DEPLOYER_ADDR   (key: DEPLOYER_KEY in $CONFIG — not printed)"
 echo
-echo "  logs:  $RUN_DIR/*.log     addresses: $ADDR_ENV"
+echo "  logs:  $RUN_DIR/*.log     addresses: $ADDR_ENV     secrets: $TOKENS_ENV"
 echo "  stop:  bash scripts/stop.sh $([ "$CONFIG" = "$ROOT/scripts/run.config" ] || echo "$CONFIG")"

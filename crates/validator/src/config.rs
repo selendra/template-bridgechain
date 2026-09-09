@@ -277,18 +277,34 @@ impl Config {
                 );
             }
 
-            // SECURITY / liveness: the refund timeout that stops validators from
-            // cancelling a still-deliverable transfer lives in the DB-backed
-            // eligibility sweep (indexer + sig-store). In file-store mode there is
-            // no such gate — refund_candidates would return every record and the
-            // loop would attest a cancel for fresh, undelivered transfers. Require
-            // the HTTP store for the refund path.
+            // SECURITY (H-2): `timeout_secs` is the age gate the refund loop
+            // enforces ITSELF, on-chain, before attesting a cancel — a transfer
+            // younger than this is still the keeper's to deliver. Zero or negative
+            // would make every unclaimed transfer immediately cancellable, which is
+            // a censorship primitive against in-flight transfers; fail closed
+            // exactly as `block_confirmation` does (audit 2026-09-09).
+            if refund.timeout_secs <= 0 {
+                anyhow::bail!(
+                    "[refund] timeout_secs = {} — must be > 0. This is the on-chain age gate \
+                     that stops validators cancelling a transfer the keeper is still about to \
+                     deliver; 0 or negative would disable it and let every fresh transfer be \
+                     burned on the destination immediately.",
+                    refund.timeout_secs
+                );
+            }
+
+            // Liveness: the refund loop still takes its CANDIDATES from the store's
+            // `refund_candidates` (which the indexer's eligibility sweep populates)
+            // and only then re-derives the age on-chain. The local file store has
+            // no lifecycle, so `refund_candidates` there is "every record ever
+            // signed": harmless for safety (the on-chain checks still bind) but
+            // it would make every validator re-read gate state for the whole
+            // history on every poll. Require the HTTP store for the refund path.
             if cfg.store.url.is_none() {
                 anyhow::bail!(
-                    "[refund] requires an HTTP [store] (url = \"http://sig-store…\"): the \
-                     unclaimed-timeout gate is enforced by the DB-backed eligibility sweep, \
-                     which the local file store does not provide. Without it the loop would \
-                     cancel transfers before the keeper can deliver them."
+                    "[refund] requires an HTTP [store] (url = \"http://sig-store…\"): the file \
+                     store keeps no lifecycle, so refund candidates there would be every \
+                     record ever signed, re-verified on-chain on every poll."
                 );
             }
         }
@@ -344,6 +360,44 @@ mod tests {
         let c = Config::from_toml(&cfg("block_confirmation = 12")).expect("nonzero should load");
         assert_eq!(c.sources[0].block_confirmation, 12);
         assert!(!c.sources[0].allow_zero_confirmation);
+    }
+
+    /// A refund block for the H-2 tests: HTTP store, one destination, a sane
+    /// finality buffer; `refund_body` is appended to the `[refund]` table.
+    fn refund_cfg(refund_body: &str) -> String {
+        format!(
+            "[source]\n\
+             chain_id = 1337\n\
+             rpcs = [\"http://localhost:8545\"]\n\
+             gate = \"0x0000000000000000000000000000000000000001\"\n\
+             block_confirmation = 3\n\
+             [signer]\n\
+             private_key = \"0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d\"\n\
+             [store]\n\
+             url = \"http://sig-store:8080\"\n\
+             [refund]\n\
+             block_confirmation = 3\n\
+             {refund_body}\n\
+             [[refund.destinations]]\n\
+             chain_id = 1338\n\
+             rpcs = [\"http://localhost:8546\"]\n\
+             gate = \"0x0000000000000000000000000000000000000002\"\n"
+        )
+    }
+
+    /// Audit 2026-09-09: a zero or negative `timeout_secs` silently disabled the
+    /// on-chain age gate (H-2), making every fresh transfer cancellable at once.
+    #[test]
+    fn refund_timeout_must_be_positive() {
+        for bad in ["timeout_secs = 0", "timeout_secs = -1", "timeout_secs = -3600"] {
+            let err = Config::from_toml(&refund_cfg(bad)).unwrap_err().to_string();
+            assert!(err.contains("timeout_secs"), "{bad}: got {err}");
+        }
+        let c = Config::from_toml(&refund_cfg("timeout_secs = 1")).expect("1s is a legal gate");
+        assert_eq!(c.refund.unwrap().timeout_secs, 1);
+        // The default is positive and therefore fine.
+        let c = Config::from_toml(&refund_cfg("")).expect("default should load");
+        assert_eq!(c.refund.unwrap().timeout_secs, 3600);
     }
 
     #[test]

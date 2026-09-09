@@ -23,9 +23,16 @@ Everything is driven by [`scripts/run.config`](scripts/run.config): chains and
 RPCs (local anvil or your own), validator keys + threshold, ports, and feature
 toggles (`ENABLE_SWAP` / `ENABLE_INDEXER` / `ENABLE_REFUND`). Point it at an
 existing deployment with `LOCAL_ANVIL=false` / `DEPLOY=false` and the `*_ADDR`
-fields. Generated per-service configs and logs land in `RUN_DIR` (default
-`/tmp/bridge-run`). Re-running is idempotent (it stops the previous run first).
-The MetaMask network + import details are printed at the end.
+fields. Generated per-service configs, pidfiles, logs and the run's secrets
+(`tokens.env`: sig-store tokens + the random Postgres password) land in
+`RUN_DIR` (default `~/.local/state/selendra-bridge/run`, 0700). Re-running is
+idempotent (it stops the previous run first; `stop.sh` kills only the pids it
+recorded — `--force` for the old pattern kills). Every gate is wired
+`setSupportedChain` -> `setLocalToken` -> `seal()` and verified before the
+services start; `EXTRA_SUPPORTED_CHAINS` lists destinations outside the mesh
+(the Solana gate), `PUBLIC_RPCS` names the browser-safe RPC the UI is served
+(the keyed one never is). The MetaMask network details are printed at the end;
+the deployer key is not.
 
 > `scripts/testing/` holds the phase/e2e demos (`e2e.sh`, `phase7.sh`,
 > `refund-relayer-e2e.sh`, …); `scripts/run.sh` is the everyday launcher.
@@ -44,7 +51,9 @@ bash scripts/bridge-from-json.sh config/bridge.config.json   # validators, keepe
 The deploy step writes every address it produced into `config/deployments/` and
 patches them into the runtime config, so no addresses are copied by hand. A
 `production` profile enforces the real safety parameters (≥ 3 validators, a
-strict-majority threshold, a guardian, ownership to a multisig). The Solana leg
+strict-majority threshold, a guardian, ownership to a multisig, every gate
+sealed with every peer listed); the `local` profile is refused on any chain id
+outside the dev/testnet allowlist in the script. The Solana leg
 is covered too — its own `solana` block in each file deploys/initializes the gate
 program and runs the relayers, sharing the EVM validator set and `bridge_domain`.
 Field reference: [`config/README.md`](config/README.md).

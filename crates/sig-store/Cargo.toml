@@ -23,3 +23,8 @@ clap = { workspace = true }
 [dev-dependencies]
 # Drive the auth-layered router in-process (no DB / no socket) via `oneshot`.
 tower = { version = "0.5", features = ["util"] }
+# The live-Postgres test (gated on BRIDGE_TEST_DATABASE_URL) signs a real record.
+bridge-core = { workspace = true, features = ["axum-auth", "abi"] }
+alloy = { workspace = true }
+alloy-primitives = { workspace = true }
+hex = { workspace = true }

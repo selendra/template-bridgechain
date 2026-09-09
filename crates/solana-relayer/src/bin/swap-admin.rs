@@ -25,7 +25,16 @@
 //!                --from <token account> --to <token account> [--min-out N]
 //!     quote      --mint-in <pubkey> --mint-out <pubkey> --amount N
 //!     pause | unpause | set-fee --fee-bps N | set-oracle --oracle <pubkey>
-//!     show
+//!     set-guardian --guardian <pubkey>
+//!     set-max-price-deviation --bps N       (1..=10000; per-reprice move cap)
+//!     set-max-price-age --seconds N         (> 0; swaps refuse a price older than this)
+//!     set-min-price-interval --seconds N    (>= 0; reprice cooldown, 0 disables)
+//!     show [--mint <pubkey> ...]             (prints max_price_age and each token's
+//!                                            price_set_at + freshness)
+//!
+//! `quote` refuses a leg whose price is stale (`PoolState::price_is_fresh`), the
+//! same check the on-chain `swap` makes, so a quote never promises an output the
+//! pool would refuse.
 //!
 //! Prices are PRICE_ONE-scaled (1e18), the same fixed point `SwapPool.sol` uses,
 //! so a price of "one hub unit" is 1000000000000000000.
@@ -75,6 +84,45 @@ impl Args {
     }
 }
 
+/// The cluster's unix time from the Clock sysvar — what the program compares
+/// `price_set_at` against, so freshness is judged on the chain's clock, not ours.
+fn cluster_now(rpc: &RpcClient) -> Option<i64> {
+    let acct = rpc.get_account(&solana_sdk::sysvar::clock::id()).ok()?;
+    solana_sdk::account::from_account::<solana_sdk::clock::Clock, _>(&acct).map(|c| c.unix_timestamp)
+}
+
+/// Human-readable freshness of a token's price under `pool`'s guard.
+fn freshness_label(pool: &Pool, rec: &TokenRec, now: i64) -> String {
+    if rec.mint == pool.hub_mint {
+        return "FRESH (hub: pinned at PRICE_ONE)".into();
+    }
+    let age = now.saturating_sub(rec.price_set_at);
+    if pool.price_is_fresh(rec, now) {
+        format!("FRESH ({age}s old, max {}s)", pool.effective_max_price_age())
+    } else if rec.price_set_at == 0 {
+        "STALE (never stamped — reprice with set-price)".into()
+    } else {
+        format!("STALE ({age}s old, max {}s)", pool.effective_max_price_age())
+    }
+}
+
+/// The check `swap` makes on-chain, applied to a quote: either leg stale => the
+/// pool would refuse (`StalePrice`), so refuse the quote with the same reason.
+fn stale_leg(pool: &Pool, rec_in: &TokenRec, rec_out: &TokenRec, now: i64) -> anyhow::Result<()> {
+    for (label, rec) in [("in", rec_in), ("out", rec_out)] {
+        if !pool.price_is_fresh(rec, now) {
+            anyhow::bail!(
+                "mint-{label} {} price is STALE (set_at {}, now {now}, max age {}s) — the pool would \
+                 refuse this swap (StalePrice); reprice it first",
+                pk(&rec.mint),
+                rec.price_set_at,
+                pool.effective_max_price_age()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let cmd = argv
@@ -118,7 +166,13 @@ fn main() -> anyhow::Result<()> {
                 println!("  hub mint     : {}", pk(&pool.hub_mint));
                 println!("  fee          : {} bps", pool.fee_bps);
                 println!("  price guards : max {} bps per {}s", pool.max_price_deviation_bps, pool.min_price_update_interval);
+                println!(
+                    "  max price age: {}s{}",
+                    pool.effective_max_price_age(),
+                    if pool.max_price_age == 0 { " (unset — failing closed at the default)" } else { "" }
+                );
                 println!("  paused       : {}", pool.paused);
+                let now = cluster_now(&rpc);
                 // The listed set is not enumerable from the pool account (each
                 // token is its own PDA), so `show` reports the ones named on the
                 // command line — pass --mint repeatedly to inspect them.
@@ -131,6 +185,14 @@ fn main() -> anyhow::Result<()> {
                             println!(
                                 "  token {} : price {} ({} dp) reserve {} vault {}",
                                 pk(&r.mint), r.price, r.decimals, r.reserve, pk(&r.vault)
+                            );
+                            println!(
+                                "    price_set_at {}  {}",
+                                r.price_set_at,
+                                match now {
+                                    Some(now) => freshness_label(&pool, &r, now),
+                                    None => "(cluster clock unreadable)".to_string(),
+                                }
                             );
                         }
                     }
@@ -147,6 +209,10 @@ fn main() -> anyhow::Result<()> {
         let pool = Pool::deserialize(&mut &rpc.get_account(&pool_pda)?.data[..])?;
         let ri = TokenRec::deserialize(&mut &rpc.get_account(&token_pda(&mint_in))?.data[..])?;
         let ro = TokenRec::deserialize(&mut &rpc.get_account(&token_pda(&mint_out))?.data[..])?;
+        // The on-chain `swap` refuses a stale leg (`StalePrice`, 0x11); a quote
+        // that ignored that would promise an output the pool will not honour.
+        let now = cluster_now(&rpc).ok_or_else(|| anyhow::anyhow!("cannot read the cluster clock"))?;
+        stale_leg(&pool, &ri, &ro, now)?;
         let out = math::amount_out(amount, ri.price, ri.decimals, ro.price, ro.decimals, pool.fee_bps)
             .ok_or_else(|| anyhow::anyhow!("quote overflows"))?;
         println!("{out}");
@@ -302,6 +368,33 @@ fn main() -> anyhow::Result<()> {
                 AccountMeta::new_readonly(payer.pubkey(), true),
             ],
         ),
+        // Owner-only price guards, same `[pool(w), owner(s)]` shape as set-fee.
+        // Ranges are enforced on-chain; checked here too so a typo fails before
+        // it costs a transaction.
+        "set-max-price-deviation" => {
+            let bps: u16 = args.req("--bps")?.parse()?;
+            anyhow::ensure!((1..=10_000).contains(&bps), "--bps must be 1..=10000");
+            (
+                SwapInstruction::SetMaxPriceDeviation { bps }.to_bytes(),
+                vec![AccountMeta::new(pool_pda, false), AccountMeta::new_readonly(payer.pubkey(), true)],
+            )
+        }
+        "set-max-price-age" => {
+            let seconds: i64 = args.req("--seconds")?.parse()?;
+            anyhow::ensure!(seconds > 0, "--seconds must be positive (there is no 'off')");
+            (
+                SwapInstruction::SetMaxPriceAge { seconds }.to_bytes(),
+                vec![AccountMeta::new(pool_pda, false), AccountMeta::new_readonly(payer.pubkey(), true)],
+            )
+        }
+        "set-min-price-interval" => {
+            let seconds: i64 = args.req("--seconds")?.parse()?;
+            anyhow::ensure!(seconds >= 0, "--seconds must be >= 0 (0 disables the cooldown)");
+            (
+                SwapInstruction::SetMinPriceUpdateInterval { seconds }.to_bytes(),
+                vec![AccountMeta::new(pool_pda, false), AccountMeta::new_readonly(payer.pubkey(), true)],
+            )
+        }
         other => anyhow::bail!("unknown command {other:?}"),
     };
 
@@ -312,4 +405,48 @@ fn main() -> anyhow::Result<()> {
     let sig = rpc.send_and_confirm_transaction(&tx)?;
     println!("{cmd} OK — tx {sig}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The enum is IMPORTED, so the compiler already keeps these names honest;
+    /// the discriminants are pinned because the browser encodes them by hand.
+    #[test]
+    fn price_guard_instructions_sit_at_discriminants_11_to_13() {
+        assert_eq!(SwapInstruction::SetFee { fee_bps: 1 }.to_bytes()[0], 10);
+        assert_eq!(SwapInstruction::SetMaxPriceDeviation { bps: 1 }.to_bytes()[0], 11);
+        assert_eq!(SwapInstruction::SetMaxPriceAge { seconds: 1 }.to_bytes()[0], 12);
+        assert_eq!(SwapInstruction::SetMinPriceUpdateInterval { seconds: 1 }.to_bytes()[0], 13);
+        // Payload widths: u16 LE, i64 LE, i64 LE.
+        assert_eq!(SwapInstruction::SetMaxPriceDeviation { bps: 0x0102 }.to_bytes(), vec![11, 0x02, 0x01]);
+        assert_eq!(SwapInstruction::SetMaxPriceAge { seconds: 2 }.to_bytes().len(), 9);
+        assert_eq!(SwapInstruction::SetMinPriceUpdateInterval { seconds: 2 }.to_bytes().len(), 9);
+    }
+
+    /// `quote` must refuse exactly what `swap` refuses: a leg whose price is
+    /// older than the pool's max age. The hub leg is always fresh.
+    #[test]
+    fn quote_refuses_a_stale_leg_and_accepts_fresh_ones() {
+        let hub = [1u8; 32];
+        let pool = Pool { hub_mint: hub, max_price_age: 100, ..Default::default() };
+        let fresh = TokenRec { mint: [2u8; 32], price_set_at: 1_000, ..Default::default() };
+        let stale = TokenRec { mint: [3u8; 32], price_set_at: 800, ..Default::default() };
+        let hub_rec = TokenRec { mint: hub, price_set_at: 0, ..Default::default() };
+        let now = 1_100;
+
+        assert!(stale_leg(&pool, &fresh, &hub_rec, now).is_ok(), "fresh + hub is fine");
+        assert!(stale_leg(&pool, &hub_rec, &fresh, now).is_ok());
+        let e = stale_leg(&pool, &fresh, &stale, now).unwrap_err().to_string();
+        assert!(e.contains("mint-out") && e.contains("STALE"), "{e}");
+        let e = stale_leg(&pool, &stale, &fresh, now).unwrap_err().to_string();
+        assert!(e.contains("mint-in"), "{e}");
+        // A never-stamped (pre-upgrade) record is stale until repriced.
+        let never = TokenRec { mint: [4u8; 32], price_set_at: 0, ..Default::default() };
+        assert!(stale_leg(&pool, &never, &hub_rec, now).is_err());
+        assert!(freshness_label(&pool, &never, now).contains("never stamped"));
+        assert!(freshness_label(&pool, &hub_rec, now).starts_with("FRESH"));
+        assert!(freshness_label(&pool, &stale, now).starts_with("STALE"));
+    }
 }

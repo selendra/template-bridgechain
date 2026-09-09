@@ -39,7 +39,7 @@ export default function App() {
         <main className={`app__main${wide ? " app__main--wide" : ""}`}>
           {view === "bridge" && <BridgeView chains={chains} wallet={wallet} solana={solana} onReview={goExplorer} />}
           {view === "swap" && <SwapView chains={chains} wallet={wallet} solana={solana} />}
-          {view === "explorer" && <Explorer chains={chains} initialFilter={explorerFilter} />}
+          {view === "explorer" && <Explorer chains={chains} initialFilter={explorerFilter} wallet={wallet} />}
         </main>
       </div>
     </div>

@@ -24,9 +24,14 @@
 //! genuine token accounts.
 //!
 //! Executed below: `process_register_corridor`, `process_set_paused`,
-//! `process_set_guardian`, `process_set_validator`, `process_register_asset`,
-//! `process_send`, `process_claim`, `process_cancel` and `process_refund` —
-//! i.e. the live paths for findings H-2, H-3, M-1, M-2, M-6 and L-3.
+//! `process_set_guardian`, `process_set_validator`, `process_set_threshold`,
+//! `process_schedule_governance`, `process_cancel_scheduled_governance`,
+//! `process_register_asset`, `process_send`, `process_claim`, `process_cancel`
+//! and `process_refund` — i.e. the live paths for findings H-2, H-3, M-1, M-2,
+//! M-6, L-3 and, from audit round 4, H-2 (governance timelock) and M-5
+//! (pre-funded PDAs). `init`'s round-4 changes (M-5 path, validator-set
+//! validation) share `create_pda_account` / `validate_validator_set` with the
+//! handlers and predicates covered here.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::instruction::{AccountMeta, Instruction};
@@ -368,24 +373,432 @@ async fn validator_set_is_capped_at_the_declared_capacity() {
     // Room for 4; the seeded config holds 3.
     let (mut ctx, owner) = setup(4, 4, Pubkey::default()).await;
 
-    let add = |v: u8| {
-        ix(
-            GateInstruction::SetValidator { validator: [v; 20], active: true },
-            vec![
-                AccountMeta::new(config_pda(), false),
-                AccountMeta::new_readonly(owner.pubkey(), true),
-            ],
-        )
-    };
+    // H-2 (round 4): an addition consumes a matured schedule, so each attempt is
+    // scheduled and aged first — this test is about the CAPACITY rule, which
+    // must still fire after the timelock is satisfied.
+    for v in [4u8, 5] {
+        exec(&mut ctx, schedule_governance(owner.pubkey(), add_validator_action_id(&[v; 20])), &[&owner])
+            .await
+            .expect("schedule");
+    }
+    advance_clock(&mut ctx, GOVERNANCE_DELAY).await;
 
-    exec(&mut ctx, add(4), &[&owner]).await.expect("the 4th fits");
+    exec(&mut ctx, set_validator(owner.pubkey(), [4; 20], true), &[&owner]).await.expect("the 4th fits");
     assert_eq!(read_config(&mut ctx).await.validators.len(), 4);
 
     // The 5th must be refused explicitly rather than blowing up inside Borsh once
     // the buffer overflows — that opaque failure was finding L-3.
-    let err = exec(&mut ctx, add(5), &[&owner]).await.expect_err("past capacity must fail");
-    assert!(format!("{err:?}").contains("Custom"), "got {err:?}");
+    let err = exec(&mut ctx, set_validator(owner.pubkey(), [5; 20], true), &[&owner])
+        .await
+        .expect_err("past capacity must fail");
+    assert!(is_custom(&err, AT_CAPACITY), "expected AtCapacity, got {err:?}");
     assert_eq!(read_config(&mut ctx).await.validators.len(), 4, "state unchanged");
+}
+
+// ---------------------------------------------------------------------------
+// H-2 (audit round 4) — governance timelock, executed through the real handlers
+//
+// `set_validator(active=true)` and a threshold DECREASE used to be instant, so a
+// compromised owner key could add one attacker validator, set threshold 1 and
+// drain every vault in a single block — while the EVM gate made the same key
+// wait 48 hours in public view. Both legs share one validator set, so the EVM
+// timelock was only ever as strong as this program's owner key.
+// ---------------------------------------------------------------------------
+
+use solana_gate::{add_validator_action_id, lower_threshold_action_id, GOVERNANCE_DELAY, GOVERNANCE_GRACE};
+use solana_program::clock::Clock;
+
+const GOVERNANCE_NOT_SCHEDULED: u32 = 17;
+const GOVERNANCE_NOT_READY: u32 = 18;
+const GOVERNANCE_EXPIRED: u32 = 19;
+const AT_CAPACITY: u32 = 9;
+
+fn gov_pda(action_id: &[u8; 32]) -> Pubkey {
+    Pubkey::find_program_address(&[b"gov", action_id], &PROGRAM_ID).0
+}
+
+fn schedule_governance(owner: Pubkey, action_id: [u8; 32]) -> Instruction {
+    ix(
+        GateInstruction::ScheduleGovernance { action_id },
+        vec![
+            AccountMeta::new_readonly(config_pda(), false),
+            AccountMeta::new(owner, true),
+            AccountMeta::new(gov_pda(&action_id), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ],
+    )
+}
+
+fn cancel_governance(who: Pubkey, action_id: [u8; 32]) -> Instruction {
+    ix(
+        GateInstruction::CancelScheduledGovernance { action_id },
+        vec![
+            AccountMeta::new_readonly(config_pda(), false),
+            AccountMeta::new_readonly(who, true),
+            AccountMeta::new(gov_pda(&action_id), false),
+        ],
+    )
+}
+
+/// `SetValidator` with the governance PDA attached (needed for an addition).
+fn set_validator(owner: Pubkey, validator: [u8; 20], active: bool) -> Instruction {
+    ix(
+        GateInstruction::SetValidator { validator, active },
+        vec![
+            AccountMeta::new(config_pda(), false),
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new(gov_pda(&add_validator_action_id(&validator)), false),
+        ],
+    )
+}
+
+/// `SetThreshold` with the governance PDA attached (needed for a decrease).
+fn set_threshold(owner: Pubkey, threshold: u32) -> Instruction {
+    ix(
+        GateInstruction::SetThreshold { threshold },
+        vec![
+            AccountMeta::new(config_pda(), false),
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new(gov_pda(&lower_threshold_action_id(threshold)), false),
+        ],
+    )
+}
+
+/// Move the CLUSTER clock forward by `secs`. The program reads `Clock::get()`,
+/// which is what the bank agrees on — not the host's wall clock — so this is the
+/// only way to age a schedule in a test.
+async fn advance_clock(ctx: &mut ProgramTestContext, secs: i64) {
+    let mut clock: Clock = ctx.banks_client.get_sysvar().await.expect("clock sysvar");
+    clock.unix_timestamp += secs;
+    ctx.set_sysvar(&clock);
+}
+
+async fn fund(ctx: &mut ProgramTestContext, who: Pubkey) {
+    let fund = solana_sdk::system_instruction::transfer(&ctx.payer.pubkey(), &who, 1_000_000_000);
+    let tx = Transaction::new_signed_with_payer(
+        &[fund],
+        Some(&ctx.payer.pubkey()),
+        &[&ctx.payer],
+        ctx.last_blockhash,
+    );
+    ctx.banks_client.process_transaction(tx).await.unwrap();
+}
+
+/// THE H-2 attack, refused: without a schedule an addition fails, and the set is
+/// untouched. An owner key on its own can no longer grant signing power.
+#[tokio::test]
+async fn adding_a_validator_without_a_schedule_is_refused() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+    let v = [0x44u8; 20];
+
+    // With the governance account supplied but never scheduled…
+    let err = exec(&mut ctx, set_validator(owner.pubkey(), v, true), &[&owner])
+        .await
+        .expect_err("an unscheduled addition must be refused");
+    assert!(is_custom(&err, GOVERNANCE_NOT_SCHEDULED), "got {err:?}");
+
+    // …and with the old two-account shape (no governance account at all).
+    let legacy = ix(
+        GateInstruction::SetValidator { validator: v, active: true },
+        vec![AccountMeta::new(config_pda(), false), AccountMeta::new_readonly(owner.pubkey(), true)],
+    );
+    let err = exec(&mut ctx, legacy, &[&owner]).await.expect_err("no gov account");
+    assert!(is_custom(&err, GOVERNANCE_NOT_SCHEDULED), "got {err:?}");
+
+    assert_eq!(read_config(&mut ctx).await.validators.len(), 3, "set untouched");
+}
+
+/// The honest path: schedule, wait out the delay, execute — and the schedule is
+/// BURNED by the execution, so it cannot be spent twice.
+#[tokio::test]
+async fn a_matured_schedule_admits_the_validator_exactly_once() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+    let v = [0x44u8; 20];
+    let action = add_validator_action_id(&v);
+
+    exec(&mut ctx, schedule_governance(owner.pubkey(), action), &[&owner]).await.expect("schedule");
+    let gov = ctx.banks_client.get_account(gov_pda(&action)).await.unwrap().expect("gov PDA created");
+    assert_eq!(gov.owner, PROGRAM_ID, "schedule must be program-owned");
+
+    advance_clock(&mut ctx, GOVERNANCE_DELAY).await;
+    exec(&mut ctx, set_validator(owner.pubkey(), v, true), &[&owner]).await.expect("matured");
+    let cfg = read_config(&mut ctx).await;
+    assert!(cfg.validators.contains(&v), "validator admitted");
+    assert_eq!(cfg.validators.len(), 4);
+
+    // One approval, one change: remove it and try to re-add on the spent schedule.
+    exec(&mut ctx, set_validator(owner.pubkey(), v, false), &[&owner]).await.expect("removal is instant");
+    assert_eq!(read_config(&mut ctx).await.validators.len(), 3);
+    let err = exec(&mut ctx, set_validator(owner.pubkey(), v, true), &[&owner])
+        .await
+        .expect_err("a consumed schedule must not authorise a second addition");
+    assert!(is_custom(&err, GOVERNANCE_NOT_SCHEDULED), "got {err:?}");
+}
+
+/// One second short of the delay is still too early.
+#[tokio::test]
+async fn an_immature_schedule_is_refused() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+    let v = [0x44u8; 20];
+    exec(&mut ctx, schedule_governance(owner.pubkey(), add_validator_action_id(&v)), &[&owner])
+        .await
+        .expect("schedule");
+
+    advance_clock(&mut ctx, GOVERNANCE_DELAY - 1).await;
+    let err = exec(&mut ctx, set_validator(owner.pubkey(), v, true), &[&owner])
+        .await
+        .expect_err("47h59m59s is not 48h");
+    assert!(is_custom(&err, GOVERNANCE_NOT_READY), "got {err:?}");
+    assert_eq!(read_config(&mut ctx).await.validators.len(), 3);
+
+    // The last second matters in both directions.
+    advance_clock(&mut ctx, 1).await;
+    exec(&mut ctx, set_validator(owner.pubkey(), v, true), &[&owner]).await.expect("now matured");
+}
+
+/// A matured schedule left lying around past the grace window is a banked
+/// instant right for whoever holds the owner key later. It expires.
+#[tokio::test]
+async fn an_expired_schedule_is_refused_and_can_be_rescheduled() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+    let v = [0x44u8; 20];
+    let action = add_validator_action_id(&v);
+    exec(&mut ctx, schedule_governance(owner.pubkey(), action), &[&owner]).await.expect("schedule");
+
+    advance_clock(&mut ctx, GOVERNANCE_DELAY + GOVERNANCE_GRACE + 1).await;
+    let err = exec(&mut ctx, set_validator(owner.pubkey(), v, true), &[&owner])
+        .await
+        .expect_err("a stale approval must not be spendable");
+    assert!(is_custom(&err, GOVERNANCE_EXPIRED), "got {err:?}");
+    assert_eq!(read_config(&mut ctx).await.validators.len(), 3);
+
+    // Re-scheduling restarts the clock on the SAME PDA (no create_account brick).
+    exec(&mut ctx, schedule_governance(owner.pubkey(), action), &[&owner]).await.expect("re-schedule");
+    let err = exec(&mut ctx, set_validator(owner.pubkey(), v, true), &[&owner])
+        .await
+        .expect_err("fresh schedule is immature again");
+    assert!(is_custom(&err, GOVERNANCE_NOT_READY), "got {err:?}");
+    advance_clock(&mut ctx, GOVERNANCE_DELAY).await;
+    exec(&mut ctx, set_validator(owner.pubkey(), v, true), &[&owner]).await.expect("matured again");
+}
+
+/// The guardian may cancel a pending grant of power (incident response), and a
+/// stranger may not. Cancelling executes nothing, so the worst a compromised
+/// guardian can do is delay.
+#[tokio::test]
+async fn the_guardian_may_cancel_a_scheduled_action_but_a_stranger_may_not() {
+    let guardian = Keypair::new();
+    let stranger = Keypair::new();
+    let (mut ctx, owner) = setup(8, 4, guardian.pubkey()).await;
+    fund(&mut ctx, guardian.pubkey()).await;
+    fund(&mut ctx, stranger.pubkey()).await;
+
+    let v = [0x44u8; 20];
+    let action = add_validator_action_id(&v);
+    exec(&mut ctx, schedule_governance(owner.pubkey(), action), &[&owner]).await.expect("schedule");
+
+    let err = exec(&mut ctx, cancel_governance(stranger.pubkey(), action), &[&stranger])
+        .await
+        .expect_err("a stranger cannot cancel");
+    assert!(format!("{err:?}").contains("MissingRequiredSignature"), "got {err:?}");
+
+    exec(&mut ctx, cancel_governance(guardian.pubkey(), action), &[&guardian])
+        .await
+        .expect("guardian cancels");
+
+    // The schedule is gone: even fully aged, the addition is refused.
+    advance_clock(&mut ctx, GOVERNANCE_DELAY).await;
+    let err = exec(&mut ctx, set_validator(owner.pubkey(), v, true), &[&owner])
+        .await
+        .expect_err("cancelled schedule authorises nothing");
+    assert!(is_custom(&err, GOVERNANCE_NOT_SCHEDULED), "got {err:?}");
+
+    // Only the owner may SCHEDULE — the guardian is a stop button, not a start one.
+    let err = exec(&mut ctx, schedule_governance(guardian.pubkey(), action), &[&guardian])
+        .await
+        .expect_err("guardian cannot schedule");
+    assert!(format!("{err:?}").contains("MissingRequiredSignature"), "got {err:?}");
+}
+
+/// A schedule authorises exactly one concrete change: approving validator A does
+/// not admit validator B.
+#[tokio::test]
+async fn a_schedule_for_one_validator_does_not_admit_another() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+    let (a, b) = ([0xAAu8; 20], [0xBBu8; 20]);
+    exec(&mut ctx, schedule_governance(owner.pubkey(), add_validator_action_id(&a)), &[&owner])
+        .await
+        .expect("schedule A");
+    advance_clock(&mut ctx, GOVERNANCE_DELAY).await;
+
+    // Attempt to add B, pointing at A's (matured) schedule account.
+    let cheat = ix(
+        GateInstruction::SetValidator { validator: b, active: true },
+        vec![
+            AccountMeta::new(config_pda(), false),
+            AccountMeta::new_readonly(owner.pubkey(), true),
+            AccountMeta::new(gov_pda(&add_validator_action_id(&a)), false),
+        ],
+    );
+    let err = exec(&mut ctx, cheat, &[&owner]).await.expect_err("wrong action's PDA");
+    assert!(format!("{err:?}").contains("InvalidSeeds"), "got {err:?}");
+    assert!(!read_config(&mut ctx).await.validators.contains(&b));
+}
+
+/// Threshold asymmetry: RAISING is instant (it makes the gate harder to move),
+/// LOWERING waits — and the approval commits to the exact value.
+#[tokio::test]
+async fn raising_the_threshold_is_instant_but_lowering_it_waits() {
+    // 3 validators, threshold 2.
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+
+    // Raise 2 -> 3: no schedule needed, even with the legacy two-account shape.
+    let raise = ix(
+        GateInstruction::SetThreshold { threshold: 3 },
+        vec![AccountMeta::new(config_pda(), false), AccountMeta::new_readonly(owner.pubkey(), true)],
+    );
+    exec(&mut ctx, raise, &[&owner]).await.expect("raising is instant");
+    assert_eq!(read_config(&mut ctx).await.threshold, 3);
+
+    // Lower 3 -> 1 without a schedule: refused.
+    let err = exec(&mut ctx, set_threshold(owner.pubkey(), 1), &[&owner])
+        .await
+        .expect_err("an unscheduled decrease must be refused");
+    assert!(is_custom(&err, GOVERNANCE_NOT_SCHEDULED), "got {err:?}");
+    assert_eq!(read_config(&mut ctx).await.threshold, 3, "unchanged");
+
+    // Schedule a decrease to 2, mature it, then try to spend it on 1.
+    exec(&mut ctx, schedule_governance(owner.pubkey(), lower_threshold_action_id(2)), &[&owner])
+        .await
+        .expect("schedule t=2");
+    advance_clock(&mut ctx, GOVERNANCE_DELAY).await;
+    let cheat = ix(
+        GateInstruction::SetThreshold { threshold: 1 },
+        vec![
+            AccountMeta::new(config_pda(), false),
+            AccountMeta::new_readonly(owner.pubkey(), true),
+            AccountMeta::new(gov_pda(&lower_threshold_action_id(2)), false),
+        ],
+    );
+    let err = exec(&mut ctx, cheat, &[&owner]).await.expect_err("t=2 approval is not a t=1 approval");
+    assert!(format!("{err:?}").contains("InvalidSeeds"), "got {err:?}");
+    assert_eq!(read_config(&mut ctx).await.threshold, 3);
+
+    // The exact scheduled value goes through.
+    exec(&mut ctx, set_threshold(owner.pubkey(), 2), &[&owner]).await.expect("scheduled decrease");
+    assert_eq!(read_config(&mut ctx).await.threshold, 2);
+}
+
+/// Removing a validator stays instant — the moment a key is known compromised is
+/// the moment it must leave the set — with no governance account required.
+#[tokio::test]
+async fn removing_a_validator_is_instant() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+    let remove = ix(
+        GateInstruction::SetValidator { validator: [3u8; 20], active: false },
+        vec![AccountMeta::new(config_pda(), false), AccountMeta::new_readonly(owner.pubkey(), true)],
+    );
+    exec(&mut ctx, remove, &[&owner]).await.expect("removal needs no schedule");
+    let cfg = read_config(&mut ctx).await;
+    assert_eq!(cfg.validators, vec![[1u8; 20], [2u8; 20]]);
+}
+
+/// M-5, for the governance PDA too: a squatter pre-funding `["gov", action_id]`
+/// must not be able to block governance.
+#[tokio::test]
+async fn a_pre_funded_governance_pda_does_not_block_scheduling() {
+    let (mut ctx, owner) = setup(8, 4, Pubkey::default()).await;
+    let action = add_validator_action_id(&[0x44u8; 20]);
+    ctx.set_account(
+        &gov_pda(&action),
+        &Account {
+            lamports: 1,
+            data: vec![],
+            owner: solana_sdk::system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        }
+        .into(),
+    );
+    exec(&mut ctx, schedule_governance(owner.pubkey(), action), &[&owner])
+        .await
+        .expect("a pre-funded PDA must not brick scheduling");
+    let gov = ctx.banks_client.get_account(gov_pda(&action)).await.unwrap().unwrap();
+    assert_eq!(gov.owner, PROGRAM_ID);
+}
+
+// ---------------------------------------------------------------------------
+// Wire compatibility: the program's `GateInstruction` and the host mirror in
+// `bridge_solana::instruction` must decode each other's bytes. A relayer builds
+// instructions from the mirror; if a variant is added to one and not the other,
+// or in a different position, the transaction is well-formed and runs the WRONG
+// handler.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_host_mirror_encodes_every_instruction_the_program_decodes() {
+    use bridge_solana::instruction as host;
+
+    let cases: Vec<(host::GateInstruction, &str)> = vec![
+        (host::GateInstruction::SetValidator { validator: [7u8; 20], active: true }, "SetValidator"),
+        (host::GateInstruction::SetThreshold { threshold: 2 }, "SetThreshold"),
+        (host::GateInstruction::RegisterAsset { debridge_id: [9u8; 32] }, "RegisterAsset"),
+        (host::GateInstruction::RegisterCorridor { chain_id_to: 1337 }, "RegisterCorridor"),
+        (host::GateInstruction::Pause, "Pause"),
+        (host::GateInstruction::Unpause, "Unpause"),
+        (host::GateInstruction::SetGuardian { guardian: [5u8; 32] }, "SetGuardian"),
+        (host::GateInstruction::ScheduleGovernance { action_id: [0xA1; 32] }, "ScheduleGovernance"),
+        (host::GateInstruction::CancelScheduledGovernance { action_id: [0xA2; 32] }, "CancelScheduledGovernance"),
+    ];
+    for (host_ix, name) in cases {
+        let bytes = host_ix.to_bytes();
+        let ours = GateInstruction::try_from_slice(&bytes)
+            .unwrap_or_else(|e| panic!("{name}: program cannot decode the mirror's bytes: {e}"));
+        // The variant NAME must match (a shifted discriminant would decode as a
+        // different, well-formed instruction), and the byte round trip must be
+        // identical (a payload field of the wrong width would not survive it).
+        let variant = |d: &str| d.split(|c| c == ' ' || c == '(').next().unwrap().to_string();
+        assert_eq!(
+            variant(&format!("{ours:?}")),
+            variant(&format!("{host_ix:?}")),
+            "{name}: decoded to a different variant"
+        );
+        assert_eq!(borsh::to_vec(&ours).unwrap(), bytes, "{name}: re-encoding diverged");
+    }
+
+    // The two governance variants are the round-4 additions and must sit at
+    // discriminants 12 and 13 — after Refund (11) — on BOTH sides.
+    assert_eq!(host::GateInstruction::ScheduleGovernance { action_id: [0; 32] }.to_bytes()[0], 12);
+    assert_eq!(host::GateInstruction::CancelScheduledGovernance { action_id: [0; 32] }.to_bytes()[0], 13);
+    assert_eq!(borsh::to_vec(&GateInstruction::ScheduleGovernance { action_id: [0; 32] }).unwrap()[0], 12);
+    assert_eq!(
+        borsh::to_vec(&GateInstruction::CancelScheduledGovernance { action_id: [0; 32] }).unwrap()[0],
+        13
+    );
+}
+
+/// The host-side `SentRecord` mirror (read by the relayer's origin-proof check
+/// and, since round 4, by its refund attester for the lock time) must be exactly
+/// what `process_send` writes.
+#[test]
+fn the_sent_record_mirror_matches_the_program() {
+    let ours = solana_gate::SentRecord {
+        debridge_id: [1u8; 32],
+        sender: Pubkey::new_from_array([2u8; 32]),
+        source_token: Pubkey::new_from_array([3u8; 32]),
+        mint: Pubkey::new_from_array([4u8; 32]),
+        amount: 500,
+        locked_at: 1_700_000_000,
+    };
+    let bytes = borsh::to_vec(&ours).unwrap();
+    assert_eq!(bytes.len(), bridge_solana::relayer::SENT_RECORD_LEN, "SENT_RECORD_LEN drifted");
+    let theirs = bridge_solana::relayer::SentRecord::try_from_slice(&bytes).expect("mirror decodes");
+    assert_eq!(theirs.debridge_id, [1u8; 32]);
+    assert_eq!(theirs.sender, [2u8; 32]);
+    assert_eq!(theirs.source_token, [3u8; 32]);
+    assert_eq!(theirs.mint, [4u8; 32]);
+    assert_eq!(theirs.amount, 500);
+    assert_eq!(theirs.locked_at, 1_700_000_000);
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,6 +1413,13 @@ async fn refund_returns_locked_funds_to_the_account_that_sent_them() {
     // The origin proof exists — this is what `refund` will trust instead of calldata.
     let sent = fx.ctx.banks_client.get_account(sent_pda(&id)).await.unwrap().unwrap();
     assert_eq!(sent.owner, PROGRAM_ID, "sent record must be program-owned");
+    // Round 4 (M-4/M-13): it carries the CLUSTER lock time, which is what a refund
+    // attester ages the transfer against instead of the store's nomination.
+    let record = solana_gate::SentRecord::deserialize(&mut &sent.data[..]).expect("decodes");
+    let clock: Clock = fx.ctx.banks_client.get_sysvar().await.unwrap();
+    assert_eq!(record.locked_at, clock.unix_timestamp, "locked_at must be the cluster clock");
+    assert_eq!(record.amount, amount);
+    assert_eq!(record.source_token, fx.user_token);
 
     // --- repay (the destination has been burned; validators attested a refund) ---
     let refund = ix(
@@ -1313,6 +1733,84 @@ async fn a_registered_asset_cannot_be_repointed() {
     exec(&mut ctx, register(real_mint, real_vault), &[&owner])
         .await
         .expect("idempotent re-registration must succeed");
+}
+
+/// M-5 (round 4), executed: a squatter pre-funding `["asset", debridge_id]` must
+/// not be able to block registration.
+///
+/// A `debridge_id` is public well before governance registers it (it is a hash
+/// of the source chain id and token), so an attacker could park one lamport on
+/// every plausible asset PDA. `system_instruction::create_account` then fails
+/// with "already in use" and the corridor can never be opened without redeploying
+/// the program — the exact brick H-2 removed from the executed marker. Every PDA
+/// now goes through the same transfer+allocate+assign path.
+#[tokio::test]
+async fn register_asset_succeeds_when_the_pda_was_pre_funded_by_a_griefer() {
+    let owner = Keypair::new();
+    let mint = Pubkey::new_unique();
+    let vault = Pubkey::new_unique();
+    let debridge_id = [42u8; 32];
+
+    let mut pt = ProgramTest::new("solana_gate", PROGRAM_ID, processor!(process_instruction));
+    pt.add_account(
+        owner.pubkey(),
+        Account {
+            lamports: 10_000_000_000,
+            data: vec![],
+            owner: solana_sdk::system_program::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    );
+    let cfg = Config {
+        owner: owner.pubkey(),
+        bridge_domain: TEST_BRIDGE_DOMAIN,
+        guardian: Pubkey::default(),
+        validators: vec![[1u8; 20]],
+        threshold: 1,
+        chain_id: CHAIN_ID,
+        paused: false,
+        max_validators: 8,
+        max_corridors: 4,
+        nonce_to: vec![],
+    };
+    let mut cfg_data = vec![0u8; config_space(8, 4)];
+    cfg.serialize(&mut &mut cfg_data[..]).unwrap();
+    pt.add_account(
+        config_pda(),
+        Account { lamports: 10_000_000_000, data: cfg_data, owner: PROGRAM_ID, executable: false, rent_epoch: 0 },
+    );
+    pt.add_account(mint, mint_account());
+    pt.add_account(vault, token_account(mint, vault_authority(), 0, COption::None, COption::None));
+    // THE griefing move: one lamport, system-owned, no data.
+    pt.add_account(
+        asset_pda(&debridge_id),
+        Account { lamports: 1, data: vec![], owner: solana_sdk::system_program::id(), executable: false, rent_epoch: 0 },
+    );
+
+    let mut ctx = pt.start_with_context().await;
+    let instruction = ix(
+        GateInstruction::RegisterAsset { debridge_id },
+        vec![
+            AccountMeta::new_readonly(config_pda(), false),
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(asset_pda(&debridge_id), false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new_readonly(vault, false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+        ],
+    );
+    exec(&mut ctx, instruction, &[&owner])
+        .await
+        .expect("a pre-funded asset PDA must NOT block registration");
+
+    let stored = ctx.banks_client.get_account(asset_pda(&debridge_id)).await.unwrap().unwrap();
+    assert_eq!(stored.owner, PROGRAM_ID, "the program took ownership");
+    let asset = AssetConfig::deserialize(&mut &stored.data[..]).unwrap();
+    assert_eq!(asset.mint, mint);
+    assert_eq!(asset.vault, vault);
+    assert!(stored.lamports >= 1, "the squatter's lamport was absorbed, not refused");
 }
 
 // ---------------------------------------------------------------------------

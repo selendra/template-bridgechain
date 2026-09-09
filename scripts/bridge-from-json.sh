@@ -46,7 +46,11 @@ j()  { jq -r "$1" "$CONFIG"; }
 jr() { jq -r "$1 // empty" "$CONFIG"; }
 
 NAME="$(j '.name')"
-RUN_DIR="$(jr '.runtime.run_dir')"; RUN_DIR="${RUN_DIR:-/tmp/bridge-json-run}"
+# Not /tmp (M-11): the generated TOMLs carry private keys and the validator
+# cursors live here; systemd-tmpfiles sweeps /tmp daily. Same root as run.sh.
+RUN_DIR="$(jr '.runtime.run_dir')"
+RUN_DIR="${RUN_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/selendra-bridge/$NAME}"
+[[ "$RUN_DIR" = /* ]] || RUN_DIR="$ROOT/$RUN_DIR"
 BIN_DIR="$(jr '.runtime.bin_dir')"; BIN_DIR="${BIN_DIR:-target/debug}"
 [[ "$BIN_DIR" = /* ]] || BIN_DIR="$ROOT/$BIN_DIR"
 LOG_LEVEL="$(jr '.runtime.log_level')"; LOG_LEVEL="${LOG_LEVEL:-info}"
@@ -201,8 +205,29 @@ fi
 
 STORE_URL="$(jr '.sig_store.url')"; STORE_URL="${STORE_URL:-http://127.0.0.1:8080}"
 STORE_BIND="$(jr '.sig_store.bind')"; STORE_BIND="${STORE_BIND:-127.0.0.1:8080}"
+TOKENS_ENV="$RUN_DIR/tokens.env"
+prev_token() { [[ -f "$TOKENS_ENV" ]] && sed -n "s/^$1=//p" "$TOKENS_ENV" | head -1 || true; }
+
+# Postgres credentials (M-10). With the container managed here, the password is
+# whatever `database.docker.password` says — and when that is null, a RANDOM one
+# per run dir, kept in tokens.env (0600) so restarts keep matching the volume,
+# and `database.url` is DERIVED from it (a configured url with a stale password
+# is exactly the "works once, then auth fails" trap). A configured password wins.
 DATABASE_URL="$(jr '.database.url')"
-[[ -n "$DATABASE_URL" ]] || die ".database.url is required (the sig-store and indexer are Postgres-backed)"
+PG_PASSWORD=""
+if pg_enabled && [[ "$MODE" != "compose" ]]; then
+  PG_USER="$(j '.database.docker.user')"; PG_DB="$(j '.database.docker.db')"; PG_PORT="$(j '.database.docker.port')"
+  PG_PASSWORD="$(jr '.database.docker.password')"
+  if [[ -z "$PG_PASSWORD" ]]; then
+    PG_PASSWORD="$(prev_token PG_PASSWORD)"
+    [[ -n "$PG_PASSWORD" ]] || PG_PASSWORD="$(rand_token)"
+    DATABASE_URL="postgres://$PG_USER:$PG_PASSWORD@127.0.0.1:$PG_PORT/$PG_DB?sslmode=disable"
+  else
+    [[ "$PG_PASSWORD" != "bridge" ]] || warn "database.docker.password is the well-known default \"bridge\" — set it to null to get a generated one"
+    [[ -n "$DATABASE_URL" ]] || DATABASE_URL="postgres://$PG_USER:$PG_PASSWORD@127.0.0.1:$PG_PORT/$PG_DB?sslmode=disable"
+  fi
+fi
+[[ -n "$DATABASE_URL" || "$MODE" == "compose" ]] || die ".database.url is required when database.docker.enabled = false (the sig-store and indexer are Postgres-backed)"
 
 export RUST_LOG="$LOG_LEVEL"
 export DATABASE_URL
@@ -218,11 +243,28 @@ if [[ "$MODE" == "compose" ]]; then
   # The password stays in the compose .env, never in a generated config.
   DATABASE_URL="postgres://$(j '.database.docker.user'):\${POSTGRES_PASSWORD}@postgres:5432/$(j '.database.docker.db')"
 fi
-mkdir -p "$CFG_DIR"
 
 # ---------------------------------------------------------------------------
 # generate configs
 # ---------------------------------------------------------------------------
+# File modes BEFORE the first write (M-11): every TOML below carries a
+# private_key, and they used to land 0644 because the umask was set only after
+# the whole generation pass.
+#   host run : 0600 files in a 0700 run dir (nothing but this user reads them);
+#   compose  : the files must be readable by the container's unprivileged uid,
+#              so they stay 0644 and the STACK DIRECTORY is 0700 instead — a
+#              bind mount is resolved by the daemon, other host users are
+#              stopped at the directory.
+if [[ "$MODE" == "compose" ]]; then
+  install -d -m 700 "$COMPOSE_DIR"
+  umask 022
+  mkdir -p "$CFG_DIR"
+else
+  umask 077
+  mkdir -p "$RUN_DIR"; chmod 700 "$RUN_DIR"
+  # anything an older version of this script left world-readable
+  find "$RUN_DIR" -maxdepth 1 -type f \( -name '*.toml' -o -name '*.env' -o -name 'chains.json' \) -exec chmod 600 {} + 2>/dev/null || true
+fi
 say "generating configs in $CFG_DIR"
 
 REFUND_ON="$(j '.refund.enabled')"
@@ -363,6 +405,32 @@ if [[ "$SOLANA_ON" == "true" ]]; then
       echo "[store]"
       echo "url = \"$STORE_URL\""
       echo "token_env = \"SIG_STORE_VALIDATOR_TOKEN\""
+      if [[ "$REFUND_ON" == "true" ]]; then
+        # The refund attester's on-chain sources (M-13): without this block the
+        # relayer votes REFUND but never CANCEL, so a stranded EVM->Solana
+        # transfer is never released. It re-derives the transfer's age from the
+        # SOURCE gate at an aged block and reads `executed`/`cancelled` on the
+        # DESTINATION gate — one [[refund.evm]] per EVM gate, so every corridor
+        # end is covered. Same timeout as the validators (one policy, one number).
+        # `rpc_env` (never `rpc`): a keyed url stays in the environment, not in
+        # the file. The variables are exported at spawn (host) or passed through
+        # the service environment (compose).
+        rbc="$(jr '.refund.block_confirmation')"; [[ "$rbc" =~ ^[0-9]+$ ]] || rbc=0
+        # The relayer refuses 0 (a reorg after a signed refund is a double-spend).
+        # On an instant-final anvil 1 is the honest minimum.
+        (( rbc >= 1 )) || rbc=1
+        echo
+        echo "[refund]"
+        echo "timeout_secs = $(j '.refund.timeout_secs')"
+        for cid in "${CHAIN_IDS[@]}"; do
+          echo
+          echo "[[refund.evm]]"
+          echo "chain_id = $cid"
+          echo "gate = \"$(cf "$cid" gate)\""
+          echo "rpc_env = \"RPC_$cid\""
+          echo "block_confirmation = $rbc"
+        done
+      fi
       if [[ "$(jq -r "($rjson).deliver // false" "$CONFIG")" == "true" ]]; then
         # The claim-submitting half (EVM -> Solana). Absent => this process only
         # SIGNS, which is a valid split: a validator need not be a keeper.
@@ -410,25 +478,74 @@ if [[ "$(j '.indexer.enabled')" == "true" ]]; then
 fi
 
 # registry the graphql API serves to the UI
+#
+# `rpc_url` is the SERVER-SIDE endpoint (rpcs[0], may carry a key) — the API uses
+# it for `executed()` reads and never serves it. `public_rpc_url` is the only
+# url a browser ever sees (H-4): `chains[].public_rpc` when set; a loopback
+# rpcs[0] is its own public url; anything else is served as null (the UI falls
+# back to the wallet's provider) and warned about here, once, by name.
+is_local_rpc() { [[ "$1" =~ ^https?://(127\.0\.0\.1|localhost|\[::1\]|0\.0\.0\.0)(:[0-9]+)?(/.*)?$ ]]; }
+for cid in "${CHAIN_IDS[@]}"; do
+  pub="$(jr ".chains[] | select(.chain_id == $cid) | .public_rpc")"
+  prim="$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")"
+  [[ -n "$pub" ]] || is_local_rpc "$prim" \
+    || warn "chain $cid has no public_rpc — the UI gets rpcUrl=null for it (rpcs[0] is never served to browsers)"
+done
+# The swap pools ride in the registry too (`swap_pool`, read over the entry's
+# own rpc_url) — `graphql.swaps[]` (multi-chain) or the older `graphql.swap`
+# (single pool). The pool's `from_block` must be at or before its deployment:
+# its token list is discovered by replaying TokenListed logs. `max_block_range`
+# is that chain's own getLogs cap — a fast chain throttled to another endpoint's
+# cap produces blocks faster than its listing history can be replayed.
 REG_JSON="$CFG_DIR/chains.json"
-jq '[ .chains[] | select(.enabled != false) | {chain_id, name, rpc_url: .rpcs[0], gate,
-                   token: ((.tokens // [])[0].address // null),
-                   tokens: (.tokens // []),
-                   router} ]' "$CONFIG" > "$REG_JSON"
-if [[ "$SOLANA_ON" == "true" && "$(j '.solana.include_in_registry')" == "true" ]]; then
-  # No rpc_url/gate: the GraphQL API registers those for on-chain `executed`
-  # lookups, and it speaks EVM JSON-RPC only. Listed, not polled.
+jq '
+  def is_local: test("^https?://(127\\.0\\.0\\.1|localhost|\\[::1\\]|0\\.0\\.0\\.0)(:[0-9]+)?(/.*)?$");
+  (.defaults.max_block_range // 1000) as $dmbr
+  | ([.graphql.swaps[]?] + (if (.graphql.swap.enabled // false) then [.graphql.swap] else [] end)) as $pools
+  | [ .chains[] | select(.enabled != false) | . as $ch
+    | ($pools | map(select(.chain_id == $ch.chain_id)) | .[0]) as $sp
+    | {chain_id, name, rpc_url: .rpcs[0], gate,
+       token: ((.tokens // [])[0].address // null),
+       tokens: (.tokens // []),
+       router}
+      + (if (.public_rpc // "") != "" then {public_rpc_url: .public_rpc}
+         elif (.rpcs[0] | is_local) then {public_rpc_url: .rpcs[0]}
+         else {} end)
+      + (if ($sp != null and ($sp.pool // "") != "")
+         then {swap_pool: {address: $sp.pool, from_block: ($sp.from_block // 0),
+                           max_block_range: ($ch.max_block_range // $dmbr)}}
+         else {} end) ]' "$CONFIG" > "$REG_JSON"
+if [[ "$SOLANA_ON" == "true" ]]; then
+  # The Solana gate is a registry entry like any other: `gate` is the base58
+  # program id (the API routes on address form: 0x = EVM, base58 = Solana),
+  # `rpc_url` the server-side endpoint it reads the gate and pool through, and
+  # `public_rpc_url` the browser-safe one (`solana.public_rpc`; a loopback rpc
+  # is its own). That is what lets the UI read a corridor's nonce and vault to
+  # build a `send` out of Solana — and it is why the row is always present when
+  # the leg is enabled: `include_in_registry` no longer gates it (the API needs
+  # the row to reach the program at all).
+  [[ "$(j '.solana.include_in_registry')" == "true" ]] \
+    || info "solana.include_in_registry is false but the row is required for the API to read the gate — listed anyway"
+  sol_pub="$(jr '.solana.public_rpc')"
+  [[ -n "$sol_pub" ]] || { is_local_rpc "$(j '.solana.rpc')" && sol_pub="$(j '.solana.rpc')"; } \
+    || warn "solana has no public_rpc — the UI gets rpcUrl=null for it (solana.rpc is never served to browsers)"
   tmp="$(mktemp)"
-  jq --slurpfile c <(jq '{solana}' "$CONFIG") '
-    . + [{ chain_id: $c[0].solana.chain_id, name: $c[0].solana.name, rpc_url: null, gate: null,
-           token: ($c[0].solana.tokens[0].mint // null),
-           tokens: [$c[0].solana.tokens[] | select(.mint != null) | {symbol, address: .mint}],
-           router: null }]' "$REG_JSON" > "$tmp" && mv "$tmp" "$REG_JSON"
-  # `mktemp` creates 0600 and `mv` carries that mode over — which makes the
-  # registry unreadable to the container uid under compose, where the file is
-  # bind-mounted rather than read by this user.
-  chmod 644 "$REG_JSON"
+  jq --slurpfile c <(jq '{solana, graphql}' "$CONFIG") --arg pub "$sol_pub" --arg prog "$SOL_PROGRAM" '
+    ($c[0].graphql.swaps // [] | map(select(.chain_id == $c[0].solana.chain_id)) | .[0].pool // "") as $sp
+    | . + [{ chain_id: $c[0].solana.chain_id, name: $c[0].solana.name,
+             rpc_url: $c[0].solana.rpc, gate: $prog,
+             token: ($c[0].solana.tokens[0].mint // null),
+             tokens: [$c[0].solana.tokens[] | select(.mint != null) | {symbol, address: .mint}],
+             router: null }
+           + (if $pub != "" then {public_rpc_url: $pub} else {} end)
+           + (if $sp != "" then {swap_pool: $sp} else {} end)]' \
+    "$REG_JSON" > "$tmp" && mv "$tmp" "$REG_JSON"
 fi
+# `mktemp` creates 0600 and `mv` carries that mode over — which makes the
+# registry unreadable to the container uid under compose, where the file is
+# bind-mounted rather than read by this user. (It holds no secrets beyond
+# rpc_url, which the configs/ directory protects the same way as the TOMLs.)
+[[ "$MODE" == "compose" ]] && chmod 644 "$REG_JSON"
 info "registry -> $REG_JSON"
 
 if [[ "$MODE" == "compose" ]]; then
@@ -515,6 +632,10 @@ if [[ "$MODE" == "compose" ]]; then
       printf '  solana-relayer-%s:\n    build: { context: %s, dockerfile: docker/Dockerfile.relayer }\n    <<: *restart\n' "$n" "$CTX"
       printf '    command: ["solana-relayer", "/configs/solana-relayer-%s.toml"]\n' "$n"
       printf '    environment:\n      SIG_STORE_VALIDATOR_TOKEN: "${SIG_STORE_VALIDATOR_TOKEN:?set SIG_STORE_VALIDATOR_TOKEN}"\n'
+      # the [[refund.evm]] readers resolve their urls from RPC_<chain> (rpc_env)
+      for cid in "${CHAIN_IDS[@]}"; do
+        printf '      RPC_%s: "${RPC_%s:?set RPC_%s in .env}"\n' "$cid" "$cid" "$cid"
+      done
       printf '    volumes:\n      - ./configs:/configs:ro\n      - ./keys:/keys:ro\n      - solana-%s-state:/data\n' "$n"
       printf '    depends_on:\n      sig-store: { condition: service_healthy }\n\n'
     done
@@ -538,24 +659,9 @@ if [[ "$MODE" == "compose" ]]; then
     printf '      - "--threshold"\n      - "%s"\n' "$THRESHOLD"
     printf '      - "--chains-file"\n      - "/configs/chains.json"\n'
     [[ "$(j '.graphql.allow_mutations')" == "true" ]] && printf '      - "--allow-mutations"\n'
-    for cid in "${CHAIN_IDS[@]}"; do
-      printf '      - "--gate"\n      - "%s=%s,%s"\n' "$cid" \
-        "$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")" "$(cf "$cid" gate)"
-    done
-    if [[ "$SOLANA_ON" == "true" ]]; then
-      printf '      - "--gate"\n      - "%s=%s,%s"\n' "$SOL_CHAIN_ID" "$(j '.solana.rpc')" "$SOL_PROGRAM"
-    fi
-    for scid in $(j '.graphql.swaps[]?.chain_id'); do
-      sp="$(j ".graphql.swaps[] | select(.chain_id == $scid) | .pool")"
-      if [[ "$scid" == "$(jr '.solana.chain_id')" && "$sp" != 0x* ]]; then
-        printf '      - "--swap"\n      - "%s=%s,%s"\n' "$scid" "$(j '.solana.rpc')" "$sp"
-      else
-        printf '      - "--swap"\n      - "%s=%s,%s,%s,%s"\n' "$scid" \
-          "$(jq -r ".chains[] | select(.chain_id == $scid) | .rpcs[0]" "$CONFIG")" "$sp" \
-          "$(j ".graphql.swaps[] | select(.chain_id == $scid) | .from_block")" \
-          "$(cf "$scid" max_block_range)"
-      fi
-    done
+    # No `--gate` / `--swap`: every gate (EVM and Solana) and every swap pool is
+    # in /configs/chains.json, read over that entry's rpc_url. No RPC url is
+    # ever written into this file (H-4: it was committed with a live key once).
     # Read-only credential, and its only one: this is the service that faces the
     # internet, so it holds nothing that can write and no database URL at all.
     printf '    environment:\n      SIG_STORE_READER_TOKEN: "${SIG_STORE_READER_TOKEN:?set SIG_STORE_READER_TOKEN}"\n'
@@ -579,27 +685,41 @@ if [[ "$MODE" == "compose" ]]; then
     for n in "${SOL_NAMES[@]}"; do printf '  solana-%s-state:\n' "$n"; done
   } > "$yml"
 
-  # Two files on purpose. `.env` carries REAL generated secrets and is gitignored;
+  # Two files on purpose. `.env` carries REAL secrets and is gitignored;
   # `.env.example` is the committable template and holds none, so a checked-in
   # example can never become the credentials someone actually runs with.
+  #
+  # The RPC urls live in .env too (H-4): compose resolves the `${RPC_<chain>}`
+  # references above from it, so the keyed urls never appear in the compose
+  # file. Secrets already in an existing .env are KEPT (regenerating must not
+  # rotate the Postgres password out from under a live volume); the RPC lines
+  # are refreshed from the config on every run.
   {
-    echo "# Template. Every value must be a fresh random secret:"
-    echo "#   openssl rand -hex 32"
+    echo "# Template. Every secret must be a fresh random value:  openssl rand -hex 32"
     echo "# One token per role, so a leak from one component cannot act as another."
     echo "POSTGRES_PASSWORD="
     for role in VALIDATOR KEEPER READER ADMIN; do echo "SIG_STORE_${role}_TOKEN="; done
+    echo "# EVM RPC endpoints for the relayers' [[refund.evm]] readers (rpc_env); may carry provider keys"
+    for cid in "${CHAIN_IDS[@]}"; do echo "RPC_$cid="; done
   } > "$COMPOSE_DIR/.env.example"
-  if [[ -f "$COMPOSE_DIR/.env" ]]; then
-    info "secrets      : $COMPOSE_DIR/.env kept (existing values left alone)"
-  else
-    umask 077
-    {
-      echo "# Generated $(basename "$0") secrets — gitignored, do not commit."
-      echo "POSTGRES_PASSWORD=$(rand_token)"
-      for role in VALIDATOR KEEPER READER ADMIN; do echo "SIG_STORE_${role}_TOKEN=$(rand_token)"; done
-    } > "$COMPOSE_DIR/.env"
-    info "secrets      : $COMPOSE_DIR/.env written (fresh random values)"
-  fi
+  env_prev() { [[ -f "$COMPOSE_DIR/.env" ]] && sed -n "s/^$1=//p" "$COMPOSE_DIR/.env" | head -1 || true; }
+  kept=false; [[ -f "$COMPOSE_DIR/.env" ]] && kept=true
+  umask 077
+  tmp_env="$(mktemp)"
+  {
+    echo "# Generated by $(basename "$0") — gitignored, do not commit."
+    echo "# Secrets are kept across regenerations; RPC lines follow the config."
+    for k in POSTGRES_PASSWORD SIG_STORE_VALIDATOR_TOKEN SIG_STORE_KEEPER_TOKEN SIG_STORE_READER_TOKEN SIG_STORE_ADMIN_TOKEN; do
+      v="$(env_prev "$k")"; [[ -n "$v" ]] || v="$(rand_token)"
+      echo "$k=$v"
+    done
+    for cid in "${CHAIN_IDS[@]}"; do
+      echo "RPC_$cid=$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")"
+    done
+  } > "$tmp_env"
+  mv "$tmp_env" "$COMPOSE_DIR/.env"; chmod 600 "$COMPOSE_DIR/.env"
+  if $kept; then info "secrets      : $COMPOSE_DIR/.env secrets kept, RPC lines refreshed"
+  else info "secrets      : $COMPOSE_DIR/.env written (fresh random values)"; fi
 
   info "compose file : $yml"
   info "configs      : $CFG_DIR ($(ls "$CFG_DIR" | wc -l) files, they hold PRIVATE KEYS)"
@@ -643,16 +763,24 @@ if pg_enabled; then
   PG_PORT="$(j '.database.docker.port')"; PG_VOL="$(j '.database.docker.volume')"
   docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
   docker volume create "$PG_VOL" >/dev/null 2>&1 || true
+  # Loopback only (M-10): a docker `-p` publish bypasses ufw, and this database
+  # is the bridge's memory — signatures, refund state, allowlists, cursors.
   docker run -d --name "$PG_NAME" \
-    -e POSTGRES_USER="$(j '.database.docker.user')" \
-    -e POSTGRES_PASSWORD="$(j '.database.docker.password')" \
-    -e POSTGRES_DB="$(j '.database.docker.db')" \
-    -v "$PG_VOL:/var/lib/postgresql/data" -p "$PG_PORT:5432" \
+    -e POSTGRES_USER="$PG_USER" \
+    -e POSTGRES_PASSWORD="$PG_PASSWORD" \
+    -e POSTGRES_DB="$PG_DB" \
+    -v "$PG_VOL:/var/lib/postgresql/data" -p "127.0.0.1:$PG_PORT:5432" \
     "$(j '.database.docker.image')" >/dev/null || die "could not start $PG_NAME"
   ok=false
-  for _ in $(seq 1 60); do docker exec "$PG_NAME" pg_isready -U "$(j '.database.docker.user')" >/dev/null 2>&1 && { ok=true; break; }; sleep 0.5; done
+  for _ in $(seq 1 60); do docker exec "$PG_NAME" pg_isready -U "$PG_USER" >/dev/null 2>&1 && { ok=true; break; }; sleep 0.5; done
   $ok || die "Postgres did not become ready"
-  info "Postgres ready on :$PG_PORT"
+  # POSTGRES_PASSWORD only applies when the volume is first initialised; a volume
+  # from an earlier run keeps its old one. Set it explicitly over the container's
+  # local socket so the generated/configured password always matches the volume.
+  docker exec "$PG_NAME" psql -q -U "$PG_USER" -d "$PG_DB" \
+    -c "ALTER USER \"$PG_USER\" WITH PASSWORD '$PG_PASSWORD';" >/dev/null 2>&1 \
+    || warn "could not set the Postgres password on the existing volume"
+  info "Postgres ready on 127.0.0.1:$PG_PORT (password in $TOKENS_ENV)"
 fi
 
 # Scoped sig-store credentials. With none set the store starts UNAUTHENTICATED:
@@ -664,15 +792,20 @@ for role in VALIDATOR KEEPER READER ADMIN; do
   lower="$(tr 'A-Z' 'a-z' <<<"$role")"
   val="$(jr ".sig_store.tokens.$lower")"
   if [[ -z "$val" ]]; then
-    [[ "$gen_if_unset" == "true" ]] || warn "sig_store.tokens.$lower unset and generate_if_unset=false — the store will run unauthenticated"
+    # The store FAILS CLOSED with no token configured (it refuses to bind unless
+    # started with --allow-unauthenticated), so this is a startup failure, not a
+    # silently open store.
+    [[ "$gen_if_unset" == "true" ]] || warn "sig_store.tokens.$lower unset and generate_if_unset=false — the store will refuse to start without every role's token"
     [[ "$gen_if_unset" == "true" ]] && val="$(rand_token)"
   fi
   export "SIG_STORE_${role}_TOKEN=$val"
 done
-umask 077
 { for role in VALIDATOR KEEPER READER ADMIN; do
     v="SIG_STORE_${role}_TOKEN"; echo "$v=${!v}"
-  done; } > "$RUN_DIR/tokens.env"
+  done
+  [[ -n "$PG_PASSWORD" ]] && echo "PG_PASSWORD=$PG_PASSWORD"
+} > "$TOKENS_ENV"
+chmod 600 "$TOKENS_ENV"
 
 if [[ "$(j '.sig_store.enabled')" == "true" ]]; then
   say "starting sig-store ($STORE_URL)"
@@ -708,6 +841,11 @@ if (( ${#SOL_FILES[@]} )); then
       || die "building solana-relayer failed"
   fi
   [[ -x "$SOL_BIN" ]] || die "missing $SOL_BIN (set solana.build = true, or point solana.bin at your build)"
+  # The relayer's [[refund.evm]] readers take their urls from RPC_<chain_id>
+  # (`rpc_env`), so a keyed url is in this process environment, not in a file.
+  for cid in "${CHAIN_IDS[@]}"; do
+    export "RPC_$cid=$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG")"
+  done
   for i in "${!SOL_FILES[@]}"; do
     spawn "$SOL_BIN ${SOL_FILES[$i]}" "solana-relayer-${SOL_NAMES[$i]}.log" "solana-relayer-${SOL_NAMES[$i]}" "${SOL_FILES[$i]}"
     info "${SOL_NAMES[$i]}"
@@ -724,37 +862,10 @@ if [[ "$(j '.graphql.enabled')" == "true" ]]; then
   say "starting graphql-api ($GQL_BIND)"
   args=(--bind "$GQL_BIND" --store-url "$STORE_URL" --threshold "$THRESHOLD" --chains-file "$REG_JSON")
   [[ "$(j '.graphql.allow_mutations')" == "true" ]] && args+=(--allow-mutations)
-  for cid in "${CHAIN_IDS[@]}"; do
-    args+=(--gate "$cid=$(jq -r ".chains[] | select(.chain_id == $cid) | .rpcs[0]" "$CONFIG"),$(cf "$cid" gate)")
-  done
-  # The Solana gate goes through the same flag; the API tells it apart by the
-  # base58 address form, so the UI can read a corridor's nonce and vault to
-  # build a `send` out of Solana.
-  if [[ "$SOLANA_ON" == "true" ]]; then
-    args+=(--gate "$SOL_CHAIN_ID=$(j '.solana.rpc'),$SOL_PROGRAM")
-  fi
-  # One --swap per pool: `swaps` is the multi-chain form, `swap` the single-pool
-  # one kept for existing configs.
-  for scid in $(j '.graphql.swaps[]?.chain_id'); do
-    sp="$(j ".graphql.swaps[] | select(.chain_id == $scid) | .pool")"
-    sfb="$(j ".graphql.swaps[] | select(.chain_id == $scid) | .from_block")"
-    # That chain's own getLogs cap, not the global one: a fast chain throttled to
-    # another endpoint's cap produces blocks faster than its pool's listing
-    # history can be replayed, and the Swap view never fills.
-    # A Solana pool is addressed by its base58 PROGRAM id and read from
-    # accounts, so it has no scan floor and no getLogs cap — send its RPC and
-    # program only.
-    if [[ "$scid" == "$(jr '.solana.chain_id')" && "$sp" != 0x* ]]; then
-      args+=(--swap "$scid=$(j '.solana.rpc'),$sp")
-    else
-      srange="$(cf "$scid" max_block_range)"
-      args+=(--swap "$scid=$(jq -r ".chains[] | select(.chain_id == $scid) | .rpcs[0]" "$CONFIG"),$sp,$sfb,${srange:-10}")
-    fi
-  done
-  if [[ "$(j '.graphql.swap.enabled // false')" == "true" ]]; then
-    scid="$(j '.graphql.swap.chain_id')"
-    args+=(--swap "$scid=$(jq -r ".chains[] | select(.chain_id == $scid) | .rpcs[0]" "$CONFIG"),$(j '.graphql.swap.pool'),$(j '.graphql.swap.from_block')")
-  fi
+  # No `--gate` / `--swap`: every gate (EVM by 0x address, Solana by base58
+  # program id) and every swap pool (`swap_pool`) is in the 0600 registry file
+  # and read over that entry's rpc_url, so no (possibly keyed) url ever sits on
+  # a world-readable command line.
   # No --db-url: graphql-api reads history through the sig-store on its reader
   # token. It is the only service meant to face the internet, so it holds no
   # database credential of its own.

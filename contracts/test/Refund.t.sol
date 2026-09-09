@@ -63,6 +63,7 @@ contract RefundTest is Test {
         // --- source chain ---
         vm.chainId(CHAIN_SRC);
         srcGate = deployTestGate(validators, 1);
+        srcGate.setSupportedChain(CHAIN_DST, true);
         token = new TestToken("Test", "TST");
         token.mint(user, 1_000 ether);
 
@@ -456,14 +457,18 @@ contract RefundTest is Test {
     // L-1: a wrong-width receiver must be unclaimable, hence refundable
     // -----------------------------------------------------------------
 
+    /// A 32-byte receiver means "non-EVM destination" to `send`, which then caps
+    /// the amount at u64 (H-3) — so these transfers use an amount that fits.
+    uint256 constant WIDE_AMOUNT = 1 ether;
+
     /// Lock funds bound for this chain pair with a 32-byte `receiver`, and return
     /// the resulting submissionId. `send` accepts the width because it cannot know
     /// the destination VM — 32 bytes is correct for a Solana destination.
     function _sendWithWideReceiver(bytes memory wide) internal returns (bytes32 id) {
         vm.chainId(CHAIN_SRC);
         vm.startPrank(user);
-        token.approve(address(srcGate), AMOUNT);
-        id = srcGate.send(address(token), AMOUNT, CHAIN_DST, wide, EMPTY_AUTO);
+        token.approve(address(srcGate), WIDE_AMOUNT);
+        id = srcGate.send(address(token), WIDE_AMOUNT, CHAIN_DST, wide, EMPTY_AUTO);
         vm.stopPrank();
     }
 
@@ -502,7 +507,7 @@ contract RefundTest is Test {
 
             vm.expectRevert(Gate.BadReceiver.selector);
             dstGate.claim(
-                debridgeId, AMOUNT, CHAIN_SRC, nonce,
+                debridgeId, WIDE_AMOUNT, CHAIN_SRC, nonce,
                 wide, EMPTY_AUTO, EMPTY_SENDER, sigs
             );
 
@@ -528,7 +533,7 @@ contract RefundTest is Test {
         // Destination burns it (the transfer can never be delivered).
         vm.chainId(CHAIN_DST);
         dstGate.cancel(
-            debridgeId, AMOUNT, CHAIN_SRC, nonce, wide, EMPTY_AUTO, EMPTY_SENDER,
+            debridgeId, WIDE_AMOUNT, CHAIN_SRC, nonce, wide, EMPTY_AUTO, EMPTY_SENDER,
             _one(v1pk, BridgeHash.getCancelId(id))
         );
         assertTrue(dstGate.cancelled(id), "destination must be burned");
@@ -536,13 +541,13 @@ contract RefundTest is Test {
         // Source returns the funds to whoever locked them.
         vm.chainId(CHAIN_SRC);
         srcGate.refund(
-            address(token), debridgeId, AMOUNT, CHAIN_DST, nonce, wide, EMPTY_AUTO, EMPTY_SENDER,
+            address(token), debridgeId, WIDE_AMOUNT, CHAIN_DST, nonce, wide, EMPTY_AUTO, EMPTY_SENDER,
             _one(v1pk, BridgeHash.getRefundId(id))
         );
 
         assertEq(
             token.balanceOf(user),
-            balanceAfterLock + AMOUNT,
+            balanceAfterLock + WIDE_AMOUNT,
             "a malformed-receiver transfer must be fully recoverable"
         );
     }

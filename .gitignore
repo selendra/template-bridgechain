@@ -87,10 +87,14 @@ config/*.local.json
 # Deploy records: generated, and they carry the RPC URLs (API keys) they used.
 config/deployments/*.json
 
-# Generated docker stacks: the configs inside carry validator/keeper keys.
+# Generated docker stacks (`bridge-from-json.sh --compose`): the configs inside
+# carry validator/keeper keys, and the compose file itself used to inline keyed
+# RPC URLs (H-4, audit round 4) — it is generated output, never source. Only
+# `.env.example` in a generated stack is committable.
 docker/*/configs/
 docker/*/.env
 docker/*/keys/
+docker/*/docker-compose.yml
 
 # Production stacks (docker/production/<role>/): the templates are tracked, the
 # filled-in copies never are. A real .env holds the sig-store tokens and the DB

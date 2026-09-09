@@ -1577,6 +1577,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
@@ -1584,9 +1585,11 @@ dependencies = [
 name = "bridge-db"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "alloy-primitives",
  "bridge-core",
  "chrono",
+ "hex",
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
@@ -5018,11 +5021,14 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 name = "sig-store"
 version = "0.1.0"
 dependencies = [
+ "alloy",
+ "alloy-primitives",
  "anyhow",
  "axum 0.7.9",
  "bridge-core",
  "bridge-db",
  "clap",
+ "hex",
  "serde",
  "serde_json",
  "tokio",

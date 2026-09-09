@@ -19,7 +19,9 @@
 //!     validator, and cap the array at the validator count.
 //!   * **skip what is already executed** — the marker PDA is authoritative.
 
+use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -34,23 +36,21 @@ use tracing::{info, warn};
 use crate::config::{SourceChain, TargetChain};
 use crate::gate::{
     compute_budget_for, decode_gate_config, domain_id, hex32, hex_bytes, recovered_address,
-    GateConfig, CANCEL_PREFIX, SPL_TOKEN,
+    GateConfig, CANCEL_PREFIX, REFUND_PREFIX, SPL_TOKEN,
 };
 use crate::store::{Store, SubmissionRecord};
 
 /// Borsh-encode the `Claim` instruction. Built here rather than via
 /// `bridge_solana::relayer::build_claim_instruction` because that helper needs
 /// the `recover` feature (k256), which cannot coexist with solana-client.
-mod wire {
+pub mod wire {
     use borsh::BorshSerialize;
 
-    #[derive(BorshSerialize, Clone, Debug, Default)]
-    pub struct AutoParamsWire {
-        pub execution_fee: u128,
-        pub flags: u64,
-        pub fallback_address: Vec<u8>,
-        pub data: Vec<u8>,
-    }
+    /// ONE definition, imported: a third hand-copied `AutoParamsWire` is how the
+    /// mirrored structs drifted before. `bridge_solana::instruction` is the
+    /// host-side twin of the program's enum and is pinned against it by the
+    /// program's own account-level suite.
+    pub use bridge_solana::instruction::AutoParamsWire;
 
     #[derive(BorshSerialize)]
     pub struct ClaimArgs {
@@ -96,6 +96,112 @@ mod wire {
         args.serialize(&mut out).expect("borsh serialize CancelArgs");
         out
     }
+
+    /// `GateInstruction::Refund` (round 4, M-4). SOURCE side: `chain_id_to` is
+    /// the far chain, because a refund is executed on the chain the transfer
+    /// LEFT. `amount` is hashed to recompute the id; the amount actually paid
+    /// comes from the program's own `["sent", id]` record.
+    #[derive(BorshSerialize)]
+    pub struct RefundArgs {
+        pub debridge_id: [u8; 32],
+        pub amount: u64,
+        pub chain_id_to: u64,
+        pub nonce: u64,
+        pub receiver: Vec<u8>,
+        pub auto: Option<AutoParamsWire>,
+        pub native_sender: Vec<u8>,
+        pub signatures: Vec<Vec<u8>>,
+    }
+
+    /// `GateInstruction::Refund` — discriminant 11. Pinned by
+    /// `refund_encoding_matches_the_shared_enum`.
+    pub fn refund_instruction_data(args: &RefundArgs) -> Vec<u8> {
+        let mut out = vec![11u8];
+        args.serialize(&mut out).expect("borsh serialize RefundArgs");
+        out
+    }
+}
+
+/// Why a stored record cannot be turned into an instruction this gate would
+/// accept. Every variant is PERMANENT for that record — retrying costs a
+/// guaranteed on-chain failure per poll — so the submitter logs it once and
+/// stops.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Unencodable {
+    /// `auto_params` is not a valid `abi.encode(AutoParamsTo)`, or carries a
+    /// value the program's `u128`/`u64` fields cannot hold.
+    AutoParams(String),
+    /// `amount` does not fit the program's `u64` (H-3 of round 4: such a transfer
+    /// is neither claimable nor cancellable here; the EVM `send` now refuses it).
+    Amount,
+    /// A required hex field is malformed.
+    Field(&'static str),
+    /// The id recomputed from the record's fields (with the decoded auto-params)
+    /// is not the record's id. Submitting would fail `NotEnoughSignatures` —
+    /// the validators signed a different hash — every single poll.
+    IdMismatch,
+}
+
+impl std::fmt::Display for Unencodable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unencodable::AutoParams(e) => write!(f, "auto_params cannot be encoded for the Solana gate: {e}"),
+            Unencodable::Amount => write!(f, "amount exceeds u64 — not representable on the Solana gate"),
+            Unencodable::Field(name) => write!(f, "malformed field {name}"),
+            Unencodable::IdMismatch => write!(
+                f,
+                "submission_id does not reproduce from the record's fields (auto_params?) — the \
+                 gate would reject any instruction built from it"
+            ),
+        }
+    }
+}
+
+/// The hash-bound fields of a record, decoded, plus the `auto` the instruction
+/// must carry — proven to reproduce the record's submissionId.
+///
+/// This is the round-4 LOW fix ("relayer ignores auto_params"): the submitter
+/// used to send `auto: None` for every record, so an EVM→Solana transfer WITH
+/// auto-params hashed to a different id on-chain and failed `NotEnoughSignatures`
+/// on every poll, burning fees forever. Now the EVM `autoParams` blob is decoded
+/// into the program's Borsh form and the id is recomputed with it BEFORE anything
+/// is submitted; a record that cannot reproduce its own id is skipped for good.
+#[derive(Debug, Clone)]
+pub struct EncodableRecord {
+    pub id: [u8; 32],
+    pub debridge_id: [u8; 32],
+    pub amount: u64,
+    pub receiver: Vec<u8>,
+    pub native_sender: Vec<u8>,
+    pub auto: Option<wire::AutoParamsWire>,
+}
+
+/// Decode and cross-check a record (pure, host-testable).
+pub fn encodable(rec: &SubmissionRecord) -> Result<EncodableRecord, Unencodable> {
+    let id = hex32(&rec.submission_id).map_err(|_| Unencodable::Field("submission_id"))?;
+    let bridge_domain = hex32(&rec.bridge_domain).map_err(|_| Unencodable::Field("bridge_domain"))?;
+    let debridge_id = hex32(&rec.debridge_id).map_err(|_| Unencodable::Field("debridge_id"))?;
+    let receiver = hex_bytes(&rec.receiver).map_err(|_| Unencodable::Field("receiver"))?;
+    let native_sender = hex_bytes(&rec.native_sender).map_err(|_| Unencodable::Field("native_sender"))?;
+    let amount: u64 = rec.amount.parse().map_err(|_| Unencodable::Amount)?;
+    let blob = hex_bytes(&rec.auto_params).map_err(|_| Unencodable::Field("auto_params"))?;
+    let auto = bridge_solana::relayer::decode_evm_auto_params(&blob)
+        .map_err(|e| Unencodable::AutoParams(e.to_string()))?;
+
+    let amount_word = bridge_solana::hash::amount_word(amount as u128);
+    let recomputed = match &auto {
+        None => bridge_solana::hash::submission_id(
+            &bridge_domain, &debridge_id, &amount_word, rec.chain_id_from, rec.chain_id_to, rec.nonce, &receiver,
+        ),
+        Some(w) => bridge_solana::hash::submission_id_with_auto(
+            &bridge_domain, &debridge_id, &amount_word, rec.chain_id_from, rec.chain_id_to, rec.nonce, &receiver,
+            &bridge_solana::relayer::wire_to_auto(w, &native_sender),
+        ),
+    };
+    if recomputed != id {
+        return Err(Unencodable::IdMismatch);
+    }
+    Ok(EncodableRecord { id, debridge_id, amount, receiver, native_sender, auto })
 }
 
 /// Signatures ordered by recovered signer, ascending, keeping ONLY registered
@@ -143,6 +249,8 @@ pub struct Submitter {
     chain_id: u64,
     poll: Duration,
     store: Store,
+    /// Records proven unencodable for this gate, warned about exactly once.
+    unencodable: Mutex<HashSet<String>>,
 }
 
 impl Submitter {
@@ -164,11 +272,31 @@ impl Submitter {
             chain_id: source.chain_id,
             poll: Duration::from_millis(target.poll_interval_ms.max(500)),
             store,
+            unencodable: Mutex::new(HashSet::new()),
         })
     }
 
+    /// Decode a record, or skip it for good with ONE warning.
+    fn encodable_or_skip(&self, rec: &SubmissionRecord) -> Option<EncodableRecord> {
+        match encodable(rec) {
+            Ok(e) => Some(e),
+            Err(why) => {
+                let mut seen = self.unencodable.lock().unwrap_or_else(|p| p.into_inner());
+                if seen.insert(rec.submission_id.clone()) {
+                    warn!(
+                        submission_id = %rec.submission_id,
+                        chain_from = rec.chain_id_from,
+                        chain_to = rec.chain_id_to,
+                        "SKIPPING permanently: {why}"
+                    );
+                }
+                None
+            }
+        }
+    }
+
     pub async fn run(self) -> anyhow::Result<()> {
-        info!(payer = %self.payer.pubkey(), program = %self.program_id, "solana claim submitter started");
+        info!(payer = %self.payer.pubkey(), program = %self.program_id, "solana claim/cancel/refund submitter started");
         // Surface the quorum requirement once, up front. This process cannot know
         // how many peers exist, but it CAN state what the gate demands — which is
         // the fact an operator running a single relayer against a 2-of-N gate is
@@ -214,6 +342,16 @@ impl Submitter {
 
     async fn tick(&self) -> anyhow::Result<()> {
         for rec in self.store.list().await? {
+            // SOURCE side (round 4, M-4): a Solana-origin transfer whose
+            // destination was burned comes back here as a `refund`.
+            if rec.chain_id_from == self.chain_id {
+                if !rec.refund_signatures.is_empty() {
+                    if let Err(e) = self.try_refund(&rec).await {
+                        warn!(submission_id = %rec.submission_id, error = %e, "refund failed");
+                    }
+                }
+                continue;
+            }
             if rec.chain_id_to != self.chain_id {
                 continue;
             }
@@ -240,8 +378,11 @@ impl Submitter {
         if rec.cancel_signatures.is_empty() {
             return Ok(false);
         }
-        let id = hex32(&rec.submission_id)?;
-        let (executed, _) = Pubkey::find_program_address(&[b"executed", &id], &self.program_id);
+        // An unencodable record is skipped for claim AND cancel: neither can be
+        // expressed to this gate. (Tell the claim path too, so it does not warn
+        // a second time.)
+        let Some(enc) = self.encodable_or_skip(rec) else { return Ok(true) };
+        let (executed, _) = Pubkey::find_program_address(&[b"executed", &enc.id], &self.program_id);
         if let Some(acct) =
             self.rpc.get_account_with_commitment(&executed, self.rpc.commitment()).await?.value
         {
@@ -251,7 +392,7 @@ impl Submitter {
         }
         let (config, _) = Pubkey::find_program_address(&[b"config"], &self.program_id);
         let cfg = decode_gate_config(&self.rpc.get_account(&config).await?.data)?;
-        self.try_cancel(rec, &id, &cfg).await
+        self.try_cancel(rec, &enc, &cfg).await
     }
 
     /// Burn a stuck transfer on this (destination) gate once validators have
@@ -264,9 +405,10 @@ impl Submitter {
     async fn try_cancel(
         &self,
         rec: &SubmissionRecord,
-        id: &[u8; 32],
+        enc: &EncodableRecord,
         gate_cfg: &GateConfig,
     ) -> anyhow::Result<bool> {
+        let id = &enc.id;
         let raw: Vec<Vec<u8>> =
             rec.cancel_signatures.iter().filter_map(|s| hex_bytes(&s.signature).ok()).collect();
         if raw.is_empty() {
@@ -281,13 +423,13 @@ impl Submitter {
         let (config, _) = Pubkey::find_program_address(&[b"config"], &self.program_id);
         let (executed, _) = Pubkey::find_program_address(&[b"executed", id], &self.program_id);
         let args = wire::CancelArgs {
-            debridge_id: hex32(&rec.debridge_id)?,
-            amount: rec.amount.parse().map_err(|_| anyhow::anyhow!("amount exceeds u64"))?,
+            debridge_id: enc.debridge_id,
+            amount: enc.amount,
             chain_id_from: rec.chain_id_from,
             nonce: rec.nonce,
-            receiver: hex_bytes(&rec.receiver)?,
-            auto: None,
-            native_sender: hex_bytes(&rec.native_sender)?,
+            receiver: enc.receiver.clone(),
+            auto: enc.auto.clone(),
+            native_sender: enc.native_sender.clone(),
             signatures,
         };
         let instruction = Instruction {
@@ -314,7 +456,8 @@ impl Submitter {
     }
 
     async fn try_claim(&self, rec: &SubmissionRecord) -> anyhow::Result<()> {
-        let id = hex32(&rec.submission_id)?;
+        let Some(enc) = self.encodable_or_skip(rec) else { return Ok(()) };
+        let id = enc.id;
         let (executed, _) = Pubkey::find_program_address(&[b"executed", &id], &self.program_id);
 
         // The marker is authoritative: if it exists this submission is spent,
@@ -325,8 +468,8 @@ impl Submitter {
             }
         }
 
-        let debridge_id = hex32(&rec.debridge_id)?;
-        let receiver = hex_bytes(&rec.receiver)?;
+        let debridge_id = enc.debridge_id;
+        let receiver = enc.receiver.clone();
         let receiver_token: [u8; 32] = receiver
             .clone()
             .try_into()
@@ -392,14 +535,14 @@ impl Submitter {
 
         let args = wire::ClaimArgs {
             debridge_id,
-            amount: rec.amount.parse().map_err(|_| anyhow::anyhow!("amount exceeds u64"))?,
+            amount: enc.amount,
             chain_id_from: rec.chain_id_from,
             nonce: rec.nonce,
             receiver,
-            // The EVM auto-params encoding does not carry over; a Solana claim
-            // reconstructs the id from the same fields the source hashed.
-            auto: None,
-            native_sender: hex_bytes(&rec.native_sender)?,
+            // Decoded from the EVM `autoParams` blob and proven (in `encodable`)
+            // to reproduce this record's id.
+            auto: enc.auto.clone(),
+            native_sender: enc.native_sender.clone(),
             signatures,
         };
 
@@ -437,6 +580,128 @@ impl Submitter {
         info!(submission_id = %rec.submission_id, tx = %sig, "CLAIMED on Solana");
         Ok(())
     }
+
+    /// SOURCE side (round 4, M-4): return the funds a Solana `send` locked, once
+    /// the validators have attested that the EVM destination burned the transfer.
+    ///
+    /// Mirrors `try_claim`/`try_cancel`: this key only pays fees; the refund
+    /// quorum carries the authority, and the program's `process_refund` re-checks
+    /// everything (origin record, quorum, asset binding, replay marker) on-chain.
+    async fn try_refund(&self, rec: &SubmissionRecord) -> anyhow::Result<()> {
+        let Some(enc) = self.encodable_or_skip(rec) else { return Ok(()) };
+        let id = enc.id;
+
+        // Replay guard first: a `["refunded", id]` marker means it is done.
+        let (refunded, _) = Pubkey::find_program_address(&[b"refunded", &id], &self.program_id);
+        if let Some(acct) = self.rpc.get_account_with_commitment(&refunded, self.rpc.commitment()).await?.value {
+            if acct.owner == self.program_id && !acct.data.is_empty() {
+                return Ok(());
+            }
+        }
+
+        // The origin record names the token account to repay; without a live one
+        // there is nothing to refund (never sent here, or already repaid).
+        let (sent, _) = Pubkey::find_program_address(&[b"sent", &id], &self.program_id);
+        let sent_acct = self.rpc.get_account_with_commitment(&sent, self.rpc.commitment()).await?.value;
+        let record = crate::refund::solana_source_record(
+            sent_acct.as_ref().map(|a| (a.owner == self.program_id, a.data.as_slice())),
+        );
+        if !record.state.sent || record.state.refunded {
+            return Ok(());
+        }
+        let source_token = {
+            let data = sent_acct.as_ref().map(|a| a.data.as_slice()).unwrap_or(&[]);
+            let r = bridge_solana::relayer::decode_sent_record(data)
+                .ok_or_else(|| anyhow::anyhow!("sent record does not decode"))?;
+            Pubkey::new_from_array(r.source_token)
+        };
+
+        let (config, _) = Pubkey::find_program_address(&[b"config"], &self.program_id);
+        let gate_cfg = decode_gate_config(&self.rpc.get_account(&config).await?.data)?;
+        let raw: Vec<Vec<u8>> =
+            rec.refund_signatures.iter().filter_map(|s| hex_bytes(&s.signature).ok()).collect();
+        let signatures = ordered_signatures(&domain_id(REFUND_PREFIX, &id), &raw, &gate_cfg);
+        if (signatures.len() as u32) < gate_cfg.threshold {
+            return Ok(()); // quorum not yet formed; the gate would reject it
+        }
+
+        let (asset, _) = Pubkey::find_program_address(&[b"asset", &enc.debridge_id], &self.program_id);
+        let (vault_authority, _) = Pubkey::find_program_address(&[b"vault_authority"], &self.program_id);
+        let asset_account = self
+            .rpc
+            .get_account(&asset)
+            .await
+            .map_err(|_| anyhow::anyhow!("no asset registered for this debridge_id"))?;
+        if asset_account.data.len() < 96 {
+            anyhow::bail!("asset account is malformed");
+        }
+        let vault = Pubkey::new_from_array(asset_account.data[64..96].try_into()?);
+
+        let args = wire::RefundArgs {
+            debridge_id: enc.debridge_id,
+            amount: enc.amount,
+            chain_id_to: rec.chain_id_to,
+            nonce: rec.nonce,
+            receiver: enc.receiver.clone(),
+            auto: enc.auto.clone(),
+            native_sender: enc.native_sender.clone(),
+            signatures,
+        };
+        let instruction = Instruction {
+            program_id: self.program_id,
+            accounts: refund_accounts(
+                config,
+                asset,
+                sent,
+                refunded,
+                self.payer.pubkey(),
+                vault,
+                source_token,
+                vault_authority,
+            ),
+            data: wire::refund_instruction_data(&args),
+        };
+        let units = compute_budget_for(gate_cfg.validators.len());
+        let blockhash = self.rpc.get_latest_blockhash().await?;
+        let tx = Transaction::new_signed_with_payer(
+            &[ComputeBudgetInstruction::set_compute_unit_limit(units), instruction],
+            Some(&self.payer.pubkey()),
+            &[&self.payer],
+            blockhash,
+        );
+        let sig = self.rpc.send_and_confirm_transaction(&tx).await?;
+        info!(submission_id = %rec.submission_id, tx = %sig, to = %source_token, "REFUNDED on Solana");
+        Ok(())
+    }
+}
+
+/// The account list `process_refund` reads, in its order:
+/// `[config, asset, sent(w), refunded(w), payer(s,w), vault(w), source_token(w),
+///   vault_authority, spl_token, system_program]`. Shared with `gate-admin refund`
+/// so the two cannot disagree.
+#[allow(clippy::too_many_arguments)]
+pub fn refund_accounts(
+    config: Pubkey,
+    asset: Pubkey,
+    sent: Pubkey,
+    refunded: Pubkey,
+    payer: Pubkey,
+    vault: Pubkey,
+    source_token: Pubkey,
+    vault_authority: Pubkey,
+) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new_readonly(config, false),
+        AccountMeta::new_readonly(asset, false),
+        AccountMeta::new(sent, false),
+        AccountMeta::new(refunded, false),
+        AccountMeta::new(payer, true),
+        AccountMeta::new(vault, false),
+        AccountMeta::new(source_token, false),
+        AccountMeta::new_readonly(vault_authority, false),
+        AccountMeta::new_readonly(Pubkey::from_str(SPL_TOKEN).expect("valid spl-token id"), false),
+        AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+    ]
 }
 
 #[cfg(test)]
@@ -758,6 +1023,67 @@ mod wire_compat_tests {
         assert_eq!(ours, theirs, "cancel instruction encoding diverged from the shared enum");
     }
 
+    /// `refund` is discriminant 11. A wrong constant here would burn fees on a
+    /// well-formed transaction that runs some other handler.
+    #[test]
+    fn refund_encoding_matches_the_shared_enum() {
+        use bridge_solana::instruction::RefundArgs as SharedRefundArgs;
+        let debridge_id = [9u8; 32];
+        let receiver = vec![0xEEu8; 20];
+        let native_sender = vec![0x11u8; 32];
+        let signatures = vec![vec![7u8; 65], vec![8u8; 65]];
+        let auto = Some(wire::AutoParamsWire {
+            execution_fee: 5,
+            flags: 1,
+            fallback_address: vec![1, 2, 3],
+            data: vec![4, 5],
+        });
+
+        let ours = wire::refund_instruction_data(&wire::RefundArgs {
+            debridge_id,
+            amount: 300,
+            chain_id_to: 1337,
+            nonce: 0,
+            receiver: receiver.clone(),
+            auto: auto.clone(),
+            native_sender: native_sender.clone(),
+            signatures: signatures.clone(),
+        });
+        let theirs = GateInstruction::Refund(SharedRefundArgs {
+            debridge_id,
+            amount: 300,
+            chain_id_to: 1337,
+            nonce: 0,
+            receiver,
+            auto,
+            native_sender,
+            signatures,
+        })
+        .to_bytes();
+        assert_eq!(ours, theirs, "refund instruction encoding diverged from the shared enum");
+        assert_eq!(ours[0], 11);
+    }
+
+    /// The account list handed to `process_refund`, in the program's order.
+    #[test]
+    fn refund_accounts_are_in_the_programs_order() {
+        let keys: Vec<Pubkey> = (1u8..=8).map(|i| Pubkey::new_from_array([i; 32])).collect();
+        let metas = refund_accounts(keys[0], keys[1], keys[2], keys[3], keys[4], keys[5], keys[6], keys[7]);
+        assert_eq!(metas.len(), 10);
+        // [config, asset, sent(w), refunded(w), payer(s,w), vault(w), source_token(w),
+        //  vault_authority, spl_token, system_program]
+        let expect_writable = [false, false, true, true, true, true, true, false, false, false];
+        for (i, m) in metas.iter().enumerate() {
+            assert_eq!(m.is_writable, expect_writable[i], "account {i} writability");
+            assert_eq!(m.is_signer, i == 4, "only the payer signs");
+            if i < 8 {
+                assert_eq!(m.pubkey, keys[i]);
+            }
+        }
+        assert_eq!(metas[8].pubkey.to_string(), SPL_TOKEN);
+        assert_eq!(metas[9].pubkey, solana_sdk::system_program::id());
+    }
+
     #[test]
     fn our_claim_encoding_matches_the_shared_instruction_enum() {
         let debridge_id = [9u8; 32];
@@ -789,5 +1115,153 @@ mod wire_compat_tests {
         .to_bytes();
 
         assert_eq!(ours, theirs, "claim instruction encoding diverged from the shared enum");
+    }
+}
+
+#[cfg(test)]
+mod encodable_tests {
+    //! The round-4 LOW fix: a record is submitted ONLY if its submissionId
+    //! reproduces from its own fields with the decoded auto-params; anything else
+    //! is skipped for good instead of burning fees on a guaranteed revert per poll.
+    use super::*;
+    use crate::store::SignerSig;
+
+    const DOMAIN: [u8; 32] = [0xD0; 32];
+    const DEBRIDGE: [u8; 32] = [9u8; 32];
+
+    fn hex0x(b: &[u8]) -> String {
+        format!("0x{}", hex::encode(b))
+    }
+
+    /// `abi.encode(AutoParamsTo)` by hand — an encoder independent of the decoder
+    /// under test (bridge-solana additionally pins the decoder against alloy).
+    fn abi_encode_auto(fee: u128, flags: u64, fallback: &[u8], data: &[u8]) -> Vec<u8> {
+        fn word(v: u64) -> [u8; 32] {
+            let mut w = [0u8; 32];
+            w[24..].copy_from_slice(&v.to_be_bytes());
+            w
+        }
+        fn bytes(b: &[u8]) -> Vec<u8> {
+            let mut out = word(b.len() as u64).to_vec();
+            out.extend_from_slice(b);
+            out.resize(32 + b.len().div_ceil(32) * 32, 0);
+            out
+        }
+        let mut fee_w = [0u8; 32];
+        fee_w[16..].copy_from_slice(&fee.to_be_bytes());
+        let fb = bytes(fallback);
+        let mut out = word(0x20).to_vec();
+        out.extend_from_slice(&fee_w);
+        out.extend_from_slice(&word(flags));
+        out.extend_from_slice(&word(0x80));
+        out.extend_from_slice(&word(0x80 + fb.len() as u64));
+        out.extend_from_slice(&fb);
+        out.extend_from_slice(&bytes(data));
+        out
+    }
+
+    fn record(amount: u64, auto: Option<(u128, u64, Vec<u8>, Vec<u8>)>) -> SubmissionRecord {
+        let receiver = vec![0xABu8; 32];
+        let native_sender = vec![0x11u8; 20];
+        let amount_word = bridge_solana::hash::amount_word(amount as u128);
+        let (id, blob) = match &auto {
+            None => (
+                bridge_solana::hash::submission_id(&DOMAIN, &DEBRIDGE, &amount_word, 1337, 7565164, 3, &receiver),
+                Vec::new(),
+            ),
+            Some((fee, flags, fb, data)) => {
+                let wire = wire::AutoParamsWire {
+                    execution_fee: *fee,
+                    flags: *flags,
+                    fallback_address: fb.clone(),
+                    data: data.clone(),
+                };
+                let auto = bridge_solana::relayer::wire_to_auto(&wire, &native_sender);
+                (
+                    bridge_solana::hash::submission_id_with_auto(
+                        &DOMAIN, &DEBRIDGE, &amount_word, 1337, 7565164, 3, &receiver, &auto,
+                    ),
+                    abi_encode_auto(*fee, *flags, fb, data),
+                )
+            }
+        };
+        SubmissionRecord {
+            submission_id: hex0x(&id),
+            bridge_domain: hex0x(&DOMAIN),
+            debridge_id: hex0x(&DEBRIDGE),
+            amount: amount.to_string(),
+            chain_id_from: 1337,
+            chain_id_to: 7565164,
+            nonce: 3,
+            receiver: hex0x(&receiver),
+            auto_params: hex0x(&blob),
+            native_sender: hex0x(&native_sender),
+            token: String::new(),
+            signatures: vec![SignerSig { signer: "0x0".into(), signature: "0x".into() }],
+            cancel_signatures: vec![],
+            refund_signatures: vec![],
+        }
+    }
+
+    #[test]
+    fn a_plain_record_reproduces_its_id_with_no_auto() {
+        let e = encodable(&record(500, None)).expect("encodable");
+        assert!(e.auto.is_none());
+        assert_eq!(e.amount, 500);
+        assert_eq!(e.debridge_id, DEBRIDGE);
+    }
+
+    /// THE fix: a record WITH auto-params now yields the Borsh payload the program
+    /// hashes, and the id reproduces — where before the submitter sent
+    /// `auto: None`, hashed to a different id, and failed every poll.
+    #[test]
+    fn a_record_with_auto_params_reproduces_its_id_with_the_decoded_payload() {
+        let e = encodable(&record(500, Some((1_000_000, 1, vec![0xAA; 20], vec![1, 2, 3]))))
+            .expect("encodable");
+        let auto = e.auto.expect("auto is carried");
+        assert_eq!(auto.execution_fee, 1_000_000);
+        assert_eq!(auto.flags, 1);
+        assert_eq!(auto.fallback_address, vec![0xAA; 20]);
+        assert_eq!(auto.data, vec![1, 2, 3]);
+    }
+
+    /// The old behaviour, made an explicit failure: dropping the auto-params
+    /// changes the id, and a record whose id does not reproduce is refused.
+    #[test]
+    fn a_record_whose_id_does_not_reproduce_is_refused() {
+        let mut rec = record(500, Some((7, 0, vec![], vec![0xCC; 5])));
+        rec.auto_params = "0x".into(); // pretend the payload was not there
+        assert_eq!(encodable(&rec).unwrap_err(), Unencodable::IdMismatch);
+
+        // Or any tampered hash-bound field.
+        let mut rec = record(500, None);
+        rec.nonce += 1;
+        assert_eq!(encodable(&rec).unwrap_err(), Unencodable::IdMismatch);
+    }
+
+    /// A payload the program cannot hold is a permanent skip, named as such.
+    #[test]
+    fn an_unrepresentable_payload_is_named_not_retried() {
+        let mut rec = record(500, Some((1, 1, vec![], vec![])));
+        // Overwrite the fee word (bytes 32..64) with a value >= 2^128.
+        let mut blob = hex_bytes(&rec.auto_params).unwrap();
+        blob[32 + 15] = 1;
+        rec.auto_params = hex0x(&blob);
+        assert!(matches!(encodable(&rec).unwrap_err(), Unencodable::AutoParams(_)));
+    }
+
+    /// Round-4 H-3's shape: an amount the program's `u64` cannot hold.
+    #[test]
+    fn an_amount_past_u64_is_a_permanent_skip() {
+        let mut rec = record(500, None);
+        rec.amount = "18446744073709551616".into(); // 2^64
+        assert_eq!(encodable(&rec).unwrap_err(), Unencodable::Amount);
+    }
+
+    #[test]
+    fn malformed_hex_is_named() {
+        let mut rec = record(500, None);
+        rec.receiver = "0xzz".into();
+        assert_eq!(encodable(&rec).unwrap_err(), Unencodable::Field("receiver"));
     }
 }

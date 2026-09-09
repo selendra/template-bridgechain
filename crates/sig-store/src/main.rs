@@ -10,10 +10,16 @@
 //!
 //!   # signature store / transaction history
 //!   POST   /submissions                  -> upsert a record + its signature(s)
-//!   GET    /submissions                  -> all records (params + signatures)
+//!                                           (at most MAX_SIGS_PER_POST signatures)
+//!   GET    /submissions?limit=&offset=   -> records (params + signatures), oldest
+//!                                           first; limit defaults to and is capped
+//!                                           at DEFAULT_PAGE
 //!   GET    /submissions/:id              -> one record (404 if unknown)
-//!   POST   /submissions/:id/claimed      -> mark claimed (body: {"claim_tx": "0x.."})
-//!   GET    /history                      -> history view (status, counts, timestamps)
+//!   POST   /submissions/:id/claimed      -> the keeper's ADVISORY claim report
+//!                                           (body: {"claim_tx": "0x.."}); writes
+//!                                           `keeper_claim_tx` only — never `status`
+//!   GET    /history?limit=&offset=       -> history view (status, counts, timestamps),
+//!                                           newest first, paged like /submissions
 //!   GET    /swaps?chain_id=&limit=       -> same-chain swap history (newest first)
 //!
 //!   # refund path (two-phase: burn on the destination, then repay on the source)
@@ -23,10 +29,12 @@
 //!   GET    /refund-candidates            -> submissions a refund relayer should
 //!                                           examine (still requires on-chain checks)
 //!
-//! The `cancelled`/`refunded` lifecycle has NO write route: those states gate the
-//! refund-candidate list, so they are set only by the indexer from observed
-//! on-chain `Cancelled`/`Refunded` events, never on a caller's word (a forged
-//! "refunded" would hide a stuck transfer from the relayers).
+//! The lifecycle (`status`, `refund_status`) has NO write route at all: those
+//! columns gate the claim and refund queues, so they are set only by the indexer
+//! from observed on-chain `Claimed`/`Cancelled`/`Refunded` events, never on a
+//! caller's word. `/claimed` used to be the exception (audit 2026-09-09, M-1): a
+//! leaked keeper token could mark any transfer — including future ones, ids
+//! being deterministic — claimed, hiding it from both queues forever.
 //!
 //!   # allowlists
 //!   GET    /allowed/tokens               -> whitelisted tokens
@@ -151,14 +159,41 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState { db };
 
+    // FAIL CLOSED. `Auth::new` drops empty tokens, so an unset (or wiped) secret
+    // leaves nothing configured — and an unconfigured `Auth` grants every scope to
+    // everyone. Warning about that and serving anyway meant one lost env var
+    // silently opened the whole store; the log line was the only difference
+    // between a correct deployment and an open one.
+    require_credentials(&auth, args.allow_unauthenticated)?;
+
+    let writes = RateLimit::new(args.rate_burst, args.rate_per_second);
+    info!(
+        burst = args.rate_burst,
+        per_second = args.rate_per_second,
+        max_body_bytes = args.max_body_bytes,
+        "write rate limit active (per bearer token)"
+    );
+    let app = build_app(state, auth, writes, args.max_body_bytes);
+
+    let listener = tokio::net::TcpListener::bind(&args.bind).await?;
+    info!(bind = %args.bind, "sig-store listening");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// The whole HTTP surface: every route group under its scope and (for writers)
+/// the per-credential rate limit. Split from `main` so tests can drive the REAL
+/// handlers through the REAL auth layering with `oneshot`.
+fn build_app(state: AppState, auth: Auth, writes: RateLimit, max_body_bytes: usize) -> Router {
     // L-5: each route group demands the NARROWEST scope that lets it work, so a
     // credential leaked from one component cannot act as another.
     //
-    // NOTE: there is deliberately no write route for the `cancelled`/`refunded`
-    // lifecycle at ANY scope. Those states gate the refund-candidate list, so a
-    // forged "refunded" would permanently hide a genuinely stuck transfer from the
-    // relayers. They are written ONLY by the indexer, from observed on-chain
-    // `Cancelled`/`Refunded` events — never on a caller's word.
+    // NOTE: there is deliberately no write route for the lifecycle (`status`,
+    // `refund_status`) at ANY scope. Those columns gate the claim and refund
+    // queues, so a forged "claimed" or "refunded" would permanently hide a
+    // transfer from the keeper and the relayers. They are written ONLY by the
+    // indexer, from observed on-chain `Claimed`/`Cancelled`/`Refunded` events —
+    // never on a caller's word. `/claimed` below is advisory (M-1).
     let read = Router::new()
         .route("/submissions", get(list_submissions))
         .route("/submissions/:id", get(get_submission))
@@ -177,13 +212,6 @@ async fn main() -> anyhow::Result<()> {
     // table without limit. Keyed on the bearer token, because the thing worth
     // bounding is what ONE credential can do; every writer here is a service
     // holding a scoped token, and several of them may share an ingress address.
-    let writes = RateLimit::new(args.rate_burst, args.rate_per_second);
-    info!(
-        burst = args.rate_burst,
-        per_second = args.rate_per_second,
-        max_body_bytes = args.max_body_bytes,
-        "write rate limit active (per bearer token)"
-    );
 
     // Validators deposit signatures and cancel/refund attestations.
     let sign = Router::new()
@@ -192,8 +220,8 @@ async fn main() -> anyhow::Result<()> {
         .route_layer(middleware::from_fn_with_state(writes.clone(), rate_limit))
         .route_layer(middleware::from_fn_with_state((auth.clone(), Scope::Sign), require_scope));
 
-    // The keeper records a claim tx. Note this is NOT authoritative for the
-    // lifecycle the indexer owns — it only annotates the row.
+    // The keeper records a claim tx. ADVISORY (M-1): it lands in
+    // `keeper_claim_tx` and nothing else — see `post_claimed`.
     let relay = Router::new()
         .route("/submissions/:id/claimed", post(post_claimed))
         .route_layer(middleware::from_fn_with_state(writes.clone(), rate_limit))
@@ -208,14 +236,7 @@ async fn main() -> anyhow::Result<()> {
         .route_layer(middleware::from_fn_with_state(writes.clone(), rate_limit))
         .route_layer(middleware::from_fn_with_state((auth.clone(), Scope::Admin), require_scope));
 
-    // FAIL CLOSED. `Auth::new` drops empty tokens, so an unset (or wiped) secret
-    // leaves nothing configured — and an unconfigured `Auth` grants every scope to
-    // everyone. Warning about that and serving anyway meant one lost env var
-    // silently opened the whole store; the log line was the only difference
-    // between a correct deployment and an open one.
-    require_credentials(&auth, args.allow_unauthenticated)?;
-
-    let app = Router::new()
+    Router::new()
         .route("/health", get(health))
         .merge(read)
         .merge(sign)
@@ -223,13 +244,8 @@ async fn main() -> anyhow::Result<()> {
         .merge(admin)
         // A submission with its signatures is a few kB; the default 2 MB let a
         // caller make the server allocate far more than any real request needs.
-        .layer(DefaultBodyLimit::max(args.max_body_bytes))
-        .with_state(state);
-
-    let listener = tokio::net::TcpListener::bind(&args.bind).await?;
-    info!(bind = %args.bind, "sig-store listening");
-    axum::serve(listener, app).await?;
-    Ok(())
+        .layer(DefaultBodyLimit::max(max_body_bytes))
+        .with_state(state)
 }
 
 async fn health() -> &'static str {
@@ -283,6 +299,30 @@ fn db_err(e: DbError) -> (StatusCode, String) {
 
 // --- signature store / transaction history -------------------------------
 
+/// Audit 2026-09-09, M-2: how many signatures one `POST /submissions` may carry.
+///
+/// An honest client sends exactly ONE — its own (`RemoteStore::upsert`). The body
+/// limit alone still let a single request carry ~1,200 signatures, each of which
+/// cost an ECDSA recovery plus a transaction, while the rate limiter counted it
+/// as one request. Four leaves room for a batching client without leaving room
+/// for that.
+const MAX_SIGS_PER_POST: usize = 4;
+
+/// Default and maximum page size for the unfiltered `GET /submissions` and
+/// `GET /history` (audit 2026-09-09, item 10). Generous so today's consumers —
+/// the GraphQL API sends no `limit` — see everything a small deployment has,
+/// while a `Read` credential can no longer pull an arbitrarily large table in
+/// one request. Larger sets are walked with `offset`.
+const DEFAULT_PAGE: u64 = 5_000;
+
+/// Resolve a caller's `limit`/`offset` into SQL-ready values: absent limit means
+/// [`DEFAULT_PAGE`], anything above it is clamped, not refused.
+fn page(limit: Option<u64>, offset: Option<u64>) -> (i64, i64) {
+    let limit = limit.unwrap_or(DEFAULT_PAGE).min(DEFAULT_PAGE) as i64;
+    let offset = offset.unwrap_or(0).min(i64::MAX as u64) as i64;
+    (limit, offset)
+}
+
 /// Upsert a record. The body carries the submission params plus one (or more)
 /// signatures in `signatures`; each is merged into the stored record, deduped
 /// by signer. Returns the merged record.
@@ -290,6 +330,16 @@ async fn post_submission(
     State(s): State<AppState>,
     Json(record): Json<SubmissionRecord>,
 ) -> Result<Json<SubmissionRecord>, (StatusCode, String)> {
+    if record.signatures.len() > MAX_SIGS_PER_POST {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "too many signatures in one request ({}); at most {MAX_SIGS_PER_POST} — a \
+                 validator posts its own signature only",
+                record.signatures.len()
+            ),
+        ));
+    }
     let sigs = record.signatures.clone();
     let mut base = record;
     base.signatures = Vec::new();
@@ -321,6 +371,10 @@ struct SubmissionQuery {
     pending: Option<String>,
     chain_id_to: Option<u64>,
     chain_id_from: Option<u64>,
+    /// Page size for the unfiltered listing (default and max [`DEFAULT_PAGE`]).
+    /// Ignored by the `pending` work queues, which are bounded by construction.
+    limit: Option<u64>,
+    offset: Option<u64>,
 }
 
 async fn list_submissions(
@@ -328,7 +382,10 @@ async fn list_submissions(
     Query(q): Query<SubmissionQuery>,
 ) -> Result<Json<Vec<SubmissionRecord>>, (StatusCode, String)> {
     let records = match (q.pending.as_deref(), q.chain_id_to, q.chain_id_from) {
-        (None, _, _) => s.db.load_all().await,
+        (None, _, _) => {
+            let (limit, offset) = page(q.limit, q.offset);
+            s.db.load_page(limit, offset).await
+        }
         (Some("claims"), Some(to), _) => s.db.pending_claims(to).await,
         (Some("refunds"), _, Some(from)) => s.db.pending_refunds(from).await,
         (Some(kind), _, _) => {
@@ -354,20 +411,41 @@ async fn get_submission(
     }
 }
 
+/// The keeper's report of its claim tx. **Advisory** (audit 2026-09-09, M-1).
+///
+/// This used to call `Db::mark_claimed` — the same authoritative write the
+/// indexer makes on an observed on-chain `Claimed` — so a holder of the Relay
+/// token could set `status='claimed'` on any id, clear its refund eligibility,
+/// and park a marker for ids that did not exist yet. Every work queue filters on
+/// `status`, and nothing ever writes it back, so the transfer vanished from both
+/// the claim path and the refund path for good.
+///
+/// Now it records `keeper_claim_tx` and nothing else: the lifecycle moves only
+/// when the indexer sees the `Claimed` event on-chain. The route is kept because
+/// the keeper still calls it; the response is unchanged.
 async fn post_claimed(
     State(s): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<ClaimedRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    s.db.mark_claimed(&id, &body.claim_tx).await.map_err(db_err)?;
-    info!(submission_id = %id, claim_tx = %body.claim_tx, "marked claimed");
+    s.db.note_keeper_claim(&id, &body.claim_tx).await.map_err(db_err)?;
+    info!(submission_id = %id, claim_tx = %body.claim_tx, "noted keeper claim report (advisory)");
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Query for [`get_history`]: an optional page, defaulting to [`DEFAULT_PAGE`].
+#[derive(serde::Deserialize)]
+struct PageQuery {
+    limit: Option<u64>,
+    offset: Option<u64>,
 }
 
 async fn get_history(
     State(s): State<AppState>,
+    Query(q): Query<PageQuery>,
 ) -> Result<Json<Vec<SubmissionHistory>>, (StatusCode, String)> {
-    Ok(Json(s.db.history().await.map_err(db_err)?))
+    let (limit, offset) = page(q.limit, q.offset);
+    Ok(Json(s.db.history_page(limit, offset).await.map_err(db_err)?))
 }
 
 /// Query for [`get_swaps`]. Both fields optional: no `chain_id` means every
@@ -706,4 +784,251 @@ mod tests {
     }
 
     // `ct_eq` and the scope table itself are covered by bridge_core::auth's tests.
+
+    // --- 2026-09-09 M-2: signatures per POST are capped ------------------------
+
+    /// A `Db` that never connects: these tests must be refused BEFORE the handler
+    /// reaches the database.
+    fn lazy_state() -> AppState {
+        AppState { db: Db::connect_lazy("postgres://nobody@127.0.0.1:1/never").unwrap() }
+    }
+
+    fn dummy_record(n_sigs: usize) -> SubmissionRecord {
+        SubmissionRecord {
+            submission_id: format!("0x{}", "ab".repeat(32)),
+            bridge_domain: format!("0x{}", "d0".repeat(32)),
+            debridge_id: format!("0x{}", "11".repeat(32)),
+            amount: "1".into(),
+            chain_id_from: 1,
+            chain_id_to: 2,
+            nonce: 0,
+            receiver: format!("0x{}", "cd".repeat(20)),
+            auto_params: "0x".into(),
+            native_sender: "0x".into(),
+            token: format!("0x{}", "ee".repeat(20)),
+            signatures: (0..n_sigs)
+                .map(|i| SignerSig {
+                    signer: format!("0x{:040x}", i + 1),
+                    signature: format!("0x{}", "00".repeat(65)),
+                })
+                .collect(),
+            cancel_signatures: vec![],
+            refund_signatures: vec![],
+        }
+    }
+
+    async fn post_json(app: Router, uri: &str, bearer: Option<&str>, body: &impl serde::Serialize) -> axum::response::Response {
+        let mut b = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(t) = bearer {
+            b = b.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        app.oneshot(b.body(Body::from(serde_json::to_vec(body).unwrap())).unwrap()).await.unwrap()
+    }
+
+    /// One POST used to carry ~1,200 signatures under the body limit, each costing
+    /// an ECDSA recovery and a transaction, while the rate limiter saw one
+    /// request. The real handler must refuse the batch up front — with no
+    /// database in reach, so the assertion also proves no query ran.
+    #[tokio::test]
+    async fn a_post_with_too_many_signatures_is_refused_before_the_database() {
+        let app = Router::new().route("/submissions", post(post_submission)).with_state(lazy_state());
+        let res = post_json(app, "/submissions", None, &dummy_record(MAX_SIGS_PER_POST + 1)).await;
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Sanity on the constant: an honest client sends one, so the cap must admit
+    /// that and stay tiny.
+    #[test]
+    fn the_per_post_cap_admits_an_honest_client_and_little_more() {
+        assert!(MAX_SIGS_PER_POST >= 1 && MAX_SIGS_PER_POST <= 8);
+    }
+
+    // --- 2026-09-09 item 10: paging ------------------------------------------
+
+    #[test]
+    fn paging_defaults_are_backward_compatible_and_clamped() {
+        // No parameters: the generous default page, from the start — what the
+        // GraphQL client (which sends nothing) gets today.
+        assert_eq!(page(None, None), (DEFAULT_PAGE as i64, 0));
+        // An explicit page is honoured...
+        assert_eq!(page(Some(50), Some(100)), (50, 100));
+        // ...and one over the cap is clamped rather than refused or unbounded.
+        assert_eq!(page(Some(u64::MAX), None).0, DEFAULT_PAGE as i64);
+        // An absurd offset cannot overflow the i64 bind.
+        assert_eq!(page(None, Some(u64::MAX)).1, i64::MAX);
+    }
+
+    // --- 2026-09-09 M-1: a Relay token cannot hide a transfer -----------------
+    //
+    // Needs a live Postgres: `BRIDGE_TEST_DATABASE_URL=postgres://… cargo test`.
+    // Skipped (passing, with a note) when the variable is unset, because the
+    // unit-test suite must stay runnable without infrastructure.
+
+    /// Live tests share one database and each runs `migrate()` on connect, and
+    /// two concurrent `CREATE TABLE IF NOT EXISTS` on a fresh database race in
+    /// Postgres (duplicate `pg_type` key). Serialise them.
+    static LIVE_DB: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn live_db_url() -> Option<String> {
+        match std::env::var("BRIDGE_TEST_DATABASE_URL") {
+            Ok(u) if !u.is_empty() => Some(u),
+            _ => {
+                eprintln!("BRIDGE_TEST_DATABASE_URL unset — skipping live-Postgres test");
+                None
+            }
+        }
+    }
+
+    /// A well-formed record (id == keccak(params), token hashes to debridge_id)
+    /// with a nonce unique to this run so re-runs against one database do not
+    /// collide, plus ONE valid signature from a fresh key.
+    fn signed_record(chain_to: u64) -> SubmissionRecord {
+        use alloy::signers::local::PrivateKeySigner;
+        use alloy::signers::SignerSync;
+        use alloy_primitives::{Address, B256, U256};
+        let token = Address::repeat_byte(0x11);
+        let debridge_id = bridge_core::debridge_id(U256::from(1337u64), token);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let receiver = Address::repeat_byte(0xAB).to_vec();
+        let domain = B256::repeat_byte(0xD0);
+        let id = bridge_core::submission_id(
+            domain,
+            debridge_id,
+            U256::from(100u64),
+            U256::from(1337u64),
+            U256::from(chain_to),
+            U256::from(nonce),
+            &receiver,
+        );
+        let signer = PrivateKeySigner::random();
+        let sig = signer.sign_message_sync(id.as_slice()).unwrap();
+        SubmissionRecord {
+            submission_id: format!("{id:#x}"),
+            bridge_domain: format!("{domain:#x}"),
+            debridge_id: format!("{debridge_id:#x}"),
+            amount: "100".into(),
+            chain_id_from: 1337,
+            chain_id_to: chain_to,
+            nonce,
+            receiver: format!("0x{}", hex::encode(&receiver)),
+            auto_params: "0x".into(),
+            native_sender: "0x".into(),
+            token: format!("{token:#x}"),
+            signatures: vec![SignerSig {
+                signer: format!("{:#x}", signer.address()),
+                signature: bridge_core::signer::encode_signature(&sig),
+            }],
+            cancel_signatures: vec![],
+            refund_signatures: vec![],
+        }
+    }
+
+    async fn get_json<T: serde::de::DeserializeOwned>(app: Router, uri: &str, bearer: &str) -> T {
+        let req = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "GET {uri}");
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// THE M-1 property, end to end through the real router and a real database:
+    /// the keeper's `POST /submissions/:id/claimed` must leave a READY transfer in
+    /// the keeper's claim queue and in the history as `signed`, and must park
+    /// nothing for an id that has no row yet. Only the indexer's `mark_claimed`
+    /// (an observed on-chain event) may take it out of the queue.
+    #[tokio::test]
+    async fn a_relay_token_cannot_hide_a_transfer() {
+        let Some(url) = live_db_url() else { return };
+        let _serial = LIVE_DB.lock().await;
+        let db = Db::connect(&url).await.expect("connect to BRIDGE_TEST_DATABASE_URL");
+        let app = build_app(AppState { db: db.clone() }, test_auth(), RateLimit::new(1_000, 1_000.0), 256 * 1024);
+
+        // A fresh chain_to per run keeps the pending-claims queue we inspect small.
+        let chain_to = 900_000 + (std::process::id() as u64 % 90_000);
+        let rec = signed_record(chain_to);
+        let id = rec.submission_id.clone();
+        let res = post_json(app.clone(), "/submissions", Some(VAL), &rec).await;
+        assert_eq!(res.status(), StatusCode::OK, "validator upsert");
+
+        let queue_uri = format!("/submissions?pending=claims&chain_id_to={chain_to}");
+        let in_queue = |q: &Vec<SubmissionRecord>| q.iter().any(|r| r.submission_id.eq_ignore_ascii_case(&id));
+        assert!(in_queue(&get_json(app.clone(), &queue_uri, KEEP).await), "premise: READY and queued");
+
+        // The keeper reports a claim. Pre-fix this set status='claimed'.
+        let claim = ClaimedRequest { claim_tx: format!("0x{}", "77".repeat(32)) };
+        let res = post_json(app.clone(), &format!("/submissions/{}/claimed", &id[2..]), Some(KEEP), &claim).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // Still in the claim queue; history still says `signed`, with the report
+        // recorded where nothing reads it for control flow.
+        assert!(
+            in_queue(&get_json(app.clone(), &queue_uri, KEEP).await),
+            "a Relay token must not remove a transfer from the claim queue"
+        );
+        let hist: Vec<SubmissionHistory> = get_json(app.clone(), "/history?limit=50", READ).await;
+        let row = hist.iter().find(|h| h.submission_id.eq_ignore_ascii_case(&id)).expect("in history");
+        assert_eq!(row.status, "signed");
+        assert_eq!(row.claim_tx, None, "the authoritative claim_tx is untouched");
+        assert_eq!(row.refund_status, "none");
+        assert_eq!(row.keeper_claim_tx.as_deref(), Some(claim.claim_tx.as_str()));
+
+        // A report for an id with no row must park NOTHING: when the row later
+        // appears (indexer `Sent`), it must come up `signed` and queued.
+        let future = signed_record(chain_to);
+        let fid = future.submission_id.clone();
+        let res = post_json(app.clone(), &format!("/submissions/{}/claimed", &fid[2..]), Some(KEEP), &claim).await;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let mut observed = future.clone();
+        observed.signatures.clear();
+        db.observe_submission(observed).await.unwrap();
+        let q: Vec<SubmissionRecord> = get_json(app.clone(), &queue_uri, KEEP).await;
+        assert!(q.iter().any(|r| r.submission_id.eq_ignore_ascii_case(&fid)), "pre-poisoning a future id must not work");
+        let hist: Vec<SubmissionHistory> = get_json(app.clone(), "/history?limit=50", READ).await;
+        let frow = hist.iter().find(|h| h.submission_id.eq_ignore_ascii_case(&fid)).unwrap();
+        assert_eq!(frow.status, "signed");
+        assert_eq!(frow.keeper_claim_tx, None, "nothing was parked for the unknown id");
+
+        // Contrast: the indexer's observed on-chain `Claimed` IS authoritative.
+        db.mark_claimed(&id, &claim.claim_tx).await.unwrap();
+        assert!(!in_queue(&get_json(app.clone(), &queue_uri, KEEP).await), "an observed claim leaves the queue");
+        let hist: Vec<SubmissionHistory> = get_json(app.clone(), "/history?limit=50", READ).await;
+        let row = hist.iter().find(|h| h.submission_id.eq_ignore_ascii_case(&id)).unwrap();
+        assert_eq!(row.status, "claimed");
+        assert_eq!(row.claim_tx.as_deref(), Some(claim.claim_tx.as_str()));
+    }
+
+    /// Paging through the real router: `limit` bounds the page and `offset` walks
+    /// it, with the default returning the same order an unbounded call would.
+    #[tokio::test]
+    async fn listing_is_paged() {
+        let Some(url) = live_db_url() else { return };
+        let _serial = LIVE_DB.lock().await;
+        let db = Db::connect(&url).await.unwrap();
+        let app = build_app(AppState { db }, test_auth(), RateLimit::new(1_000, 1_000.0), 256 * 1024);
+        for _ in 0..3 {
+            let res = post_json(app.clone(), "/submissions", Some(VAL), &signed_record(1338)).await;
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+        let all: Vec<SubmissionRecord> = get_json(app.clone(), "/submissions", READ).await;
+        assert!(all.len() >= 3);
+        let p1: Vec<SubmissionRecord> = get_json(app.clone(), "/submissions?limit=2", READ).await;
+        assert_eq!(p1.len(), 2);
+        let p2: Vec<SubmissionRecord> = get_json(app.clone(), "/submissions?limit=2&offset=2", READ).await;
+        assert_eq!(p1[0].submission_id, all[0].submission_id);
+        assert_eq!(p1[1].submission_id, all[1].submission_id);
+        assert_eq!(p2[0].submission_id, all[2].submission_id);
+        let h: Vec<SubmissionHistory> = get_json(app.clone(), "/history?limit=1", READ).await;
+        assert_eq!(h.len(), 1);
+    }
 }

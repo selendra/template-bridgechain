@@ -40,3 +40,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # solana-program 1.18 pins curve25519-dalek 3.2.1, which caps zeroize at <1.4,
 # and k256 0.13 requires zeroize ^1.5. 0.6 is already in the resolved tree.
 libsecp256k1 = "0.6"
+# The host-side mirror of this program's instruction enum and account layouts.
+# `tests/account_level.rs` decodes bytes IT produces with the program's own
+# `GateInstruction`, so the two definitions can no longer drift apart silently
+# — which is how the relayer's mirrored `Config`/`SubmissionRecord` broke once.
+# default-features = false drops k256 (zeroize ^1.5 vs solana-program's <1.4).
+bridge-solana = { path = "../bridge-solana", default-features = false }

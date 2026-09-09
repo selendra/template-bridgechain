@@ -158,12 +158,13 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         a refusal — so a delayed action can never run without first sitting
     ///         out {GOVERNANCE_DELAY} in public view.
     /// @dev    Keyed by the action ids {addValidatorActionId} /
-    ///         {lowerThresholdActionId} derive, so a schedule authorises exactly
-    ///         one concrete change (this validator, that threshold) rather than a
-    ///         blanket right to change the set.
+    ///         {lowerThresholdActionId} / {setLocalTokenActionId} derive, so a
+    ///         schedule authorises exactly one concrete change (this validator,
+    ///         that threshold, this corridor) rather than a blanket right.
     mapping(bytes32 actionId => uint256 readyAt) public governanceReadyAt;
 
-    /// @notice How long a validator ADDITION or a threshold DECREASE must wait.
+    /// @notice How long a validator ADDITION, a threshold DECREASE or (once
+    ///         {isSealed}) a corridor REGISTRATION must wait.
     ///
     /// @dev    THIS IS THE SAME DEFENCE AS {UPGRADE_DELAY}, and it exists because
     ///         without it the upgrade timelock was decorative.
@@ -179,11 +180,66 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         Constant, not owner-settable, for the reason {UPGRADE_DELAY} is.
     uint256 public constant GOVERNANCE_DELAY = 48 hours;
 
+    /// @notice How long a MATURED schedule (governance or upgrade) stays
+    ///         executable before it expires.
+    ///
+    /// @dev    Without this a schedule was a banked instant right for life: an
+    ///         owner could queue a validator addition, let it mature, and hold it
+    ///         unused for years — and a key stolen at any later date inherited
+    ///         every matured schedule as an instant action, which is exactly what
+    ///         {GOVERNANCE_DELAY} exists to deny. The window is generous enough to
+    ///         execute a planned change across a weekend or a missed maintenance
+    ///         slot, and short enough that a stale approval cannot outlive the
+    ///         public attention the delay bought. An expired schedule is simply
+    ///         re-scheduled, which restarts the delay in public view again.
+    ///
+    ///         Constant, not owner-settable, for the reason {UPGRADE_DELAY} is.
+    uint256 public constant SCHEDULE_GRACE = 7 days;
+
+    // --- corridor registry (appended in the H-1 / M-3 revision) ---
+
+    /// @notice One-way flag: once set, registering a NEW corridor via
+    ///         {setLocalToken} goes through {scheduleGovernance} + {GOVERNANCE_DELAY}
+    ///         like every other power-granting owner action.
+    ///
+    /// @dev    WHY A SETUP PHASE. A gate starts with an empty registry, and an
+    ///         operator wiring a fresh mesh registers tens of corridors in one
+    ///         sitting while the gate holds nothing. Forcing 48 hours per corridor
+    ///         there protects no funds and would push operators toward keeping a
+    ///         separate "instant" path around. So `setLocalToken` is a plain owner
+    ///         action while `!isSealed`, and the deployment procedure ends with
+    ///         {seal} BEFORE liquidity is provisioned.
+    ///
+    ///         WHY IT MUST BE ONE-WAY. After seal the registry is what stands
+    ///         between an owner key and the vault (finding H-1): a fake asset on
+    ///         chain A, honestly attested by validators, mapped onto this gate's
+    ///         USDC, is a full drain in one block. With the delay, observers see
+    ///         `GovernanceScheduled(setLocalTokenActionId(...))` and have
+    ///         {GOVERNANCE_DELAY} to verify the SOURCE asset behind the debridgeId
+    ///         — and the guardian can {cancelScheduledGovernance} it. An owner who
+    ///         could un-seal would have that delay only nominally.
+    bool public isSealed;
+
+    /// @notice Destination chains `send` may lock funds towards.
+    ///
+    /// @dev    A transfer needs a gate on `chainIdTo` to be either claimed or
+    ///         cancelled, and a refund requires the cancel. Funds sent to a chain
+    ///         id with no gate (a typo, a chain this mesh never joined) were
+    ///         therefore locked with no recovery path at all (finding M-3). The
+    ///         registry makes that impossible: `send` refuses any chain the owner
+    ///         has not listed. Listing is an instant owner action because it only
+    ///         ever RESTRICTS what users can do — it grants no power over funds —
+    ///         and de-listing is likewise instant so a dead corridor can be closed
+    ///         the moment it is known to be dead.
+    mapping(uint256 chainId => bool) public supportedChain;
+
     /// @dev Reserved so a future version can append state without colliding with
     ///      anything a child contract or a later gap-consuming field occupies.
     ///      Adding N slots of new state means shrinking this by exactly N.
-    ///      (`governanceReadyAt` took one; 50 -> 49.)
-    uint256[49] private __gap;
+    ///      (`governanceReadyAt` took one: 50 -> 49. `isSealed` and
+    ///      `supportedChain` took one each: 49 -> 47. The gap still ends at
+    ///      slot 63, so the layout is upgrade-compatible with the live gates.)
+    uint256[47] private __gap;
 
     /// @param token the ERC-20 locked on THIS chain. Not part of the submissionId
     ///        (which commits to `debridgeId`, a one-way hash of it), so it is
@@ -243,6 +299,11 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         `readyAt` is when it becomes executable — the public warning.
     event GovernanceScheduled(bytes32 indexed actionId, uint256 readyAt);
     event GovernanceCancelled(bytes32 indexed actionId);
+    /// @notice The setup phase ended: from now on every new corridor waits out
+    ///         {GOVERNANCE_DELAY}. Irreversible.
+    event Sealed();
+    /// @notice A destination chain was listed (`ok`) or de-listed for `send`.
+    event SupportedChainSet(uint256 indexed chainId, bool ok);
 
     error NotOwner();
     error ZeroAmount();
@@ -288,6 +349,19 @@ contract Gate is Initializable, UUPSUpgradeable {
     error GovernanceNotScheduled(bytes32 actionId);
     /// @dev the scheduled governance action is still inside its {GOVERNANCE_DELAY}
     error GovernanceNotReady(bytes32 actionId, uint256 readyAt);
+    /// @dev the schedule matured more than {SCHEDULE_GRACE} ago and is void; it
+    ///      must be re-scheduled. `key` is the governance `actionId`, or for an
+    ///      upgrade the implementation address left-padded into a bytes32.
+    error ScheduleExpired(bytes32 key, uint256 readyAt);
+    /// @dev {seal} was called on a gate that is already sealed
+    error AlreadySealed();
+    /// @dev `send` towards a chain the owner has not listed in {supportedChain}
+    error UnsupportedChain(uint256 chainIdTo);
+    /// @dev a 32-byte (non-EVM) receiver was given an amount the destination VM
+    ///      cannot represent. The Solana gate carries amounts as u64 and rejects
+    ///      anything wider on BOTH claim and cancel, so such a transfer could
+    ///      neither be delivered nor refunded (finding H-3).
+    error AmountTooWide(uint256 amount);
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -387,6 +461,10 @@ contract Gate is Initializable, UUPSUpgradeable {
         uint256 readyAt = upgradeReadyAt[newImplementation];
         if (readyAt == 0) revert UpgradeNotScheduled(newImplementation);
         if (block.timestamp < readyAt) revert UpgradeNotReady(newImplementation, readyAt);
+        // A matured schedule is not a right for life — see {SCHEDULE_GRACE}.
+        if (block.timestamp > readyAt + SCHEDULE_GRACE) {
+            revert ScheduleExpired(bytes32(uint256(uint160(newImplementation))), readyAt);
+        }
         delete upgradeReadyAt[newImplementation];
     }
 
@@ -420,9 +498,22 @@ contract Gate is Initializable, UUPSUpgradeable {
         return keccak256(abi.encode("lowerThreshold", t));
     }
 
-    /// @notice Queue a validator addition or threshold decrease for execution once
-    ///         {GOVERNANCE_DELAY} has elapsed. Build `actionId` with
-    ///         {addValidatorActionId} / {lowerThresholdActionId}.
+    /// @notice The action id for registering `localToken` as the asset behind
+    ///         `debridgeId` (required by {setLocalToken} once {isSealed}).
+    /// @dev    Commits to BOTH halves, so a matured approval for "debridgeId X
+    ///         pays out token Y" cannot be spent to point X at anything else.
+    function setLocalTokenActionId(bytes32 debridgeId, address localToken)
+        public
+        pure
+        returns (bytes32)
+    {
+        return keccak256(abi.encode("setLocalToken", debridgeId, localToken));
+    }
+
+    /// @notice Queue a validator addition, threshold decrease or (after {seal})
+    ///         corridor registration for execution once {GOVERNANCE_DELAY} has
+    ///         elapsed. Build `actionId` with {addValidatorActionId} /
+    ///         {lowerThresholdActionId} / {setLocalTokenActionId}.
     /// @dev    Re-scheduling RESTARTS the delay, for the same reason
     ///         {scheduleUpgrade} does: otherwise one matured schedule would be an
     ///         indefinitely re-usable instant-change right against that action.
@@ -442,12 +533,14 @@ contract Gate is Initializable, UUPSUpgradeable {
         emit GovernanceCancelled(actionId);
     }
 
-    /// @dev Require a matured schedule for `actionId`, then BURN it, so one
-    ///      approval authorises exactly one change. Mirrors {_authorizeUpgrade}.
+    /// @dev Require a matured, unexpired schedule for `actionId`, then BURN it,
+    ///      so one approval authorises exactly one change. Mirrors
+    ///      {_authorizeUpgrade}, including the {SCHEDULE_GRACE} expiry.
     function _consumeGovernance(bytes32 actionId) internal {
         uint256 readyAt = governanceReadyAt[actionId];
         if (readyAt == 0) revert GovernanceNotScheduled(actionId);
         if (block.timestamp < readyAt) revert GovernanceNotReady(actionId, readyAt);
+        if (block.timestamp > readyAt + SCHEDULE_GRACE) revert ScheduleExpired(actionId, readyAt);
         delete governanceReadyAt[actionId];
     }
 
@@ -512,16 +605,52 @@ contract Gate is Initializable, UUPSUpgradeable {
     ///         asset Y, with no change to anything the validators attested. The
     ///         same read backs `SwapRouter._settle`'s `UnexpectedAsset` guard.
     ///
-    ///         So a nonzero mapping is immutable. Registering a corridor is still a
-    ///         plain owner action; *changing* one is not — deploy a new gate, or
-    ///         route the asset through a fresh debridgeId. `address(0)` is rejected
-    ///         because zero is the "unregistered" sentinel `claim` tests against.
+    ///         So a nonzero mapping is immutable; *changing* a corridor is never
+    ///         possible — deploy a new gate, or route the asset through a fresh
+    ///         debridgeId. `address(0)` is rejected because zero is the
+    ///         "unregistered" sentinel `claim` tests against.
+    ///
+    ///         DELAYED AFTER {seal} (finding H-1). Write-once stops a corridor from
+    ///         being REPOINTED, but registering a NEW one is just as dangerous once
+    ///         the gate holds liquidity: the owner mints a worthless token W on
+    ///         chain A, `send`s 1,000,000 of it here, validators honestly attest
+    ///         the fact, and `setLocalToken(keccak(A, W), USDC)` turns those
+    ///         signatures into a claim on this gate's entire USDC pot — in one
+    ///         block, with none of the notice the validator/threshold/upgrade
+    ///         timelocks force. So while `!isSealed` (the empty gate is being wired)
+    ///         this is an instant owner action; after {seal} it consumes a matured
+    ///         {setLocalTokenActionId} schedule, which gives observers
+    ///         {GOVERNANCE_DELAY} to inspect the SOURCE asset behind `debridgeId`
+    ///         and the guardian time to {cancelScheduledGovernance} a bad one.
     function setLocalToken(bytes32 debridgeId, address localToken) external onlyOwner {
         if (localToken == address(0)) revert ZeroAddress();
         address current = tokenOf[debridgeId];
         if (current != address(0)) revert LocalTokenAlreadySet(debridgeId, current);
+        if (isSealed) _consumeGovernance(setLocalTokenActionId(debridgeId, localToken));
         tokenOf[debridgeId] = localToken;
         emit LocalTokenSet(debridgeId, localToken);
+    }
+
+    /// @notice End the setup phase. From here on every new corridor waits out
+    ///         {GOVERNANCE_DELAY}. IRREVERSIBLE — see {isSealed} for why.
+    /// @dev    Call this as the last wiring step and BEFORE provisioning
+    ///         liquidity: an unsealed gate that holds funds is exactly the H-1
+    ///         drain waiting for an owner key.
+    function seal() external onlyOwner {
+        if (isSealed) revert AlreadySealed();
+        isSealed = true;
+        emit Sealed();
+    }
+
+    /// @notice List (or de-list) a destination chain for `send`.
+    /// @dev    Instant in both directions, deliberately — see {supportedChain}.
+    ///         Listing a chain grants nobody power over funds (a claim there still
+    ///         needs its own gate and a validator quorum), and de-listing only
+    ///         stops NEW locks; in-flight transfers are unaffected because
+    ///         `claim`, `cancel` and `refund` never consult this registry.
+    function setSupportedChain(uint256 chainId, bool ok) external onlyOwner {
+        supportedChain[chainId] = ok;
+        emit SupportedChainSet(chainId, ok);
     }
 
     /// @notice Appoint (or clear) the guardian who can trip the circuit breaker.
@@ -557,12 +686,18 @@ contract Gate is Initializable, UUPSUpgradeable {
     /// @notice Lock `amount` of `token` and emit a `Sent` event for validators.
     /// @param token      the ERC-20 to lock on this (source) chain
     /// @param amount     amount to bridge
-    /// @param chainIdTo  destination chain id
+    /// @param chainIdTo  destination chain id. Must be listed in {supportedChain}:
+    ///                   a chain with no gate can neither claim nor cancel, so
+    ///                   funds locked towards it would have no recovery path.
     /// @param receiver   destination recipient. Its width is fixed by the target VM:
     ///                   20 bytes for an EVM address, or 32 bytes for a non-EVM
     ///                   account key (e.g. a Solana pubkey / SPL associated token
     ///                   account). Any other length is rejected so funds can't lock
-    ///                   here against a receiver the target gate can't decode.
+    ///                   here against a receiver the target gate can't decode. A
+    ///                   32-byte receiver additionally caps `amount` at
+    ///                   `type(uint64).max` — the widest amount the Solana gate
+    ///                   can claim OR cancel, so anything larger would be locked
+    ///                   with no way out.
     /// @param autoParams empty bytes for none, or abi.encode(AutoParamsTo) for an
     ///                   execution payload
     function send(
@@ -573,11 +708,19 @@ contract Gate is Initializable, UUPSUpgradeable {
         bytes calldata autoParams
     ) external whenNotPaused returns (bytes32 submissionId) {
         if (amount == 0) revert ZeroAmount();
+        if (!supportedChain[chainIdTo]) revert UnsupportedChain(chainIdTo);
         // The receiver is only ever hashed and emitted here (never dereferenced on
         // this chain), but we still pin its width to the destination address size:
         // 20 = EVM address, 32 = Solana/non-EVM account key. A wrong length means a
         // malformed recipient, so reject rather than lock funds against garbage.
         if (receiver.length != 20 && receiver.length != 32) revert BadReceiver();
+        // Non-EVM leg: the Solana program's ClaimArgs/CancelArgs carry `amount`
+        // as a u64 and recompute the submissionId from it, so an amount that does
+        // not fit can be neither delivered nor cancelled — and without a cancel
+        // there is no refund. Refuse to lock it in the first place. Note that no
+        // decimals normalisation exists anywhere in this bridge; for an 18-dec
+        // token the cap is ~18.44 whole tokens, which is the point of the check.
+        if (receiver.length == 32 && amount > type(uint64).max) revert AmountTooWide(amount);
 
         uint256 nonce = nonceTo[chainIdTo];
         bytes32 debridgeId = BridgeHash.getDebridgeId(block.chainid, token);

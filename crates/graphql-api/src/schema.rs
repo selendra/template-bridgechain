@@ -16,6 +16,58 @@ use bridge_core::store::{SignerSig, SubmissionRecord};
 use crate::chain::{ChainInfo, Chains};
 use crate::swap::{PoolInfo, PoolToken, Swaps};
 
+/// Rows returned by a list query when the caller passes no `limit`.
+pub const DEFAULT_PAGE: u64 = 50;
+/// Hard ceiling on rows per list query, whatever `limit` says. Bounds the
+/// per-row `eth_call` fan-out of `executed`/`cancelled`/`status` (M-8) together
+/// with the `complexity` multipliers below.
+pub const MAX_PAGE: u64 = 200;
+/// Complexity charged for one field that costs an upstream RPC call
+/// (`executed`, `cancelled`, `status`). With the list multipliers this is what
+/// makes `limit_complexity` a bound on RPC fan-out rather than on JSON size.
+pub const CHAIN_READ_COST: usize = 20;
+
+/// Effective page size for a `limit` argument: default when absent, capped at
+/// [`MAX_PAGE`], never zero.
+pub fn page_size(limit: Option<u64>) -> usize {
+    limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE) as usize
+}
+
+/// The `limit`/`offset` window over an already-loaded list.
+///
+/// The page is cut HERE, after the resolver's own filters, rather than asked of
+/// the store. The sig-store now takes `limit`/`offset` on `GET /submissions` and
+/// `GET /history` (`RemoteStore::load_page` / `history_page`, server default and
+/// cap 5,000 rows) — but those routes take no `chain_id_from`/`chain_id_to`/
+/// `stuck` filters, so a server-side window under a client-side filter would
+/// return short, misaligned pages. Until the store filters too, the store's cap
+/// bounds the load and this bounds the response; the finding's point — per-row
+/// chain reads happen only for the rows RETURNED — holds either way, and the
+/// wire shape will not change when the cut moves server-side.
+pub fn paginate<T>(rows: Vec<T>, limit: Option<u64>, offset: Option<u64>) -> Vec<T> {
+    let skip = offset.unwrap_or(0) as usize;
+    rows.into_iter().skip(skip).take(page_size(limit)).collect()
+}
+
+/// Turn a store/backend failure into a client-facing GraphQL error.
+///
+/// `RemoteError`'s `Display` is reqwest's, and reqwest prints the request URL —
+/// i.e. the sig-store's internal address (and, in a misconfigured deployment,
+/// anything in its userinfo). That went straight into the `errors[]` of the one
+/// service that faces the internet. The detail is logged here; the client gets
+/// a fixed message. Store-side rejections (`StoreError`: bad id, signature
+/// mismatch, ...) carry no URL and are still passed through — the caller needs
+/// them to fix its input.
+pub fn store_error(e: anyhow::Error) -> async_graphql::Error {
+    if e.downcast_ref::<bridge_core::remote::RemoteError>().is_some()
+        || e.downcast_ref::<reqwest::Error>().is_some()
+    {
+        tracing::warn!(error = ?e, "signature store request failed");
+        return async_graphql::Error::new("signature store unavailable");
+    }
+    async_graphql::Error::new(e.to_string())
+}
+
 /// Shared, read-mostly state handed to every resolver via the schema's data.
 pub struct ApiState {
     pub backend: Arc<StoreBackend>,
@@ -46,7 +98,11 @@ pub struct ApiState {
 pub struct Chain {
     pub chain_id: u64,
     pub name: String,
-    /// Read-only RPC for off-wallet reads (decimals/balances). Null when unset.
+    /// Browser-safe, KEYLESS read-only RPC for off-wallet reads
+    /// (decimals/balances) — the registry's `public_rpc_url`. Null when the
+    /// operator has not published one; the UI then reads through the wallet.
+    /// The server-side `rpc_url` (which may carry a provider key) is never
+    /// returned here.
     pub rpc_url: Option<String>,
     /// Deployed Gate on this chain, or null if it isn't pinned server-side.
     pub gate: Option<String>,
@@ -72,7 +128,8 @@ impl From<ChainInfo> for Chain {
         Chain {
             chain_id: c.chain_id,
             name: c.name,
-            rpc_url: c.rpc_url,
+            // H-4: only the public endpoint ever crosses the wire.
+            rpc_url: c.public_rpc_url,
             gate: c.gate,
             token: c.token,
             tokens: c
@@ -107,6 +164,13 @@ pub struct PoolTokenView {
     pub max_swap_usd: String,
     /// True for the pool's core-price stablecoin.
     pub is_stable: bool,
+    /// Unix seconds the current price was set (Solana only; null on EVM).
+    /// `0` means never stamped, which the program treats as stale.
+    pub price_set_at: Option<i64>,
+    /// Whether the program would accept this price now (Solana only; null on
+    /// EVM). `false` means a swap through this token reverts `StalePrice` and
+    /// `swapQuote` returns null for it.
+    pub price_fresh: Option<bool>,
 }
 
 /// What a browser needs to build a Solana gate `send`. See the resolver for why
@@ -141,6 +205,9 @@ pub struct SwapPoolInfo {
     /// `0x`-prefixed core stablecoin (unit of account).
     pub stable: String,
     pub tokens: Vec<PoolTokenView>,
+    /// Max age (seconds) of a token price the program will still swap at —
+    /// the effective `max_price_age`. Solana only; null on EVM.
+    pub max_price_age: Option<i64>,
 }
 
 impl SwapPoolInfo {
@@ -150,6 +217,7 @@ impl SwapPoolInfo {
             address: info.address,
             stable: info.stable,
             tokens: info.tokens.into_iter().map(Into::into).collect(),
+            max_price_age: info.max_price_age,
         }
     }
 }
@@ -165,6 +233,8 @@ impl From<PoolToken> for PoolTokenView {
             reserve: p.reserve,
             max_swap_usd: p.max_swap_usd,
             is_stable: p.is_stable,
+            price_set_at: p.price_set_at,
+            price_fresh: p.price_fresh,
         }
     }
 }
@@ -267,12 +337,14 @@ impl Submission {
 impl Submission {
     /// On-chain `executed(submissionId)` on the destination gate. `null` when the
     /// API has no `--gate` configured for `chainIdTo` (or the RPC call failed).
+    #[graphql(complexity = "CHAIN_READ_COST")]
     async fn executed(&self, ctx: &Context<'_>) -> Option<bool> {
         state(ctx).chains.executed(self.chain_id_to, &self.submission_id).await
     }
 
     /// On-chain `cancelled(submissionId)`: the transfer was burned on the
     /// destination so it could be refunded on the source, rather than delivered.
+    #[graphql(complexity = "CHAIN_READ_COST")]
     async fn cancelled(&self, ctx: &Context<'_>) -> Option<bool> {
         state(ctx).chains.cancelled(self.chain_id_to, &self.submission_id).await
     }
@@ -281,6 +353,7 @@ impl Submission {
     /// the destination gate confirms delivery, otherwise READY/PENDING from the
     /// signature count, or UNKNOWN if neither a threshold nor a destination RPC
     /// is configured.
+    #[graphql(complexity = "CHAIN_READ_COST")]
     async fn status(&self, ctx: &Context<'_>) -> SubmissionStatus {
         let chains = &state(ctx).chains;
         if chains.executed(self.chain_id_to, &self.submission_id).await == Some(true) {
@@ -486,18 +559,23 @@ pub struct Query;
 
 #[Object]
 impl Query {
-    /// All submissions, newest filters applied. Sorted by (chainIdFrom,
-    /// chainIdTo, nonce) for a stable order.
+    /// Submissions matching `filter`, sorted by (chainIdFrom, chainIdTo, nonce)
+    /// for a stable order, as one page: `limit` rows (default 50, at most 200)
+    /// starting at `offset` (default 0). Both are optional, so existing clients
+    /// keep working and simply receive the first page.
+    #[graphql(complexity = "page_size(limit) * child_complexity")]
     async fn submissions(
         &self,
         ctx: &Context<'_>,
         filter: Option<SubmissionFilter>,
+        limit: Option<u64>,
+        offset: Option<u64>,
     ) -> async_graphql::Result<Vec<Submission>> {
         let st = state(ctx);
         let f = filter.unwrap_or_default();
         let threshold = st.threshold;
 
-        let mut records = st.backend.load_all().await?;
+        let mut records = st.backend.load_all().await.map_err(store_error)?;
         records.sort_by(|a, b| {
             (a.chain_id_from, a.chain_id_to, a.nonce).cmp(&(
                 b.chain_id_from,
@@ -518,7 +596,7 @@ impl Query {
             })
             .map(|r| Submission::from_record(r, threshold))
             .collect();
-        Ok(out)
+        Ok(paginate(out, limit, offset))
     }
 
     /// A single submission by its `0x`-prefixed submissionId, or null if unknown.
@@ -536,7 +614,7 @@ impl Query {
             ));
         }
         let st = state(ctx);
-        let rec = st.backend.load(&submission_id).await?;
+        let rec = st.backend.load(&submission_id).await.map_err(store_error)?;
         Ok(rec.map(|r| Submission::from_record(r, st.threshold)))
     }
 
@@ -572,7 +650,9 @@ impl Query {
     /// On-chain `quote` for a same-chain swap: the pegged output (net of fee,
     /// before the reserve cap) for swapping `amountIn` of `tokenIn` into
     /// `tokenOut`, as a decimal string. `null` when the chain isn't configured,
-    /// an address/amount is malformed, or a token isn't listed (call reverts).
+    /// an address/amount is malformed, a token isn't listed (call reverts), or —
+    /// on Solana — a leg's price is older than the pool's `maxPriceAge`, which
+    /// the program would reject as `StalePrice` (see `PoolTokenView.priceFresh`).
     async fn swap_quote(
         &self,
         ctx: &Context<'_>,
@@ -670,7 +750,7 @@ impl Query {
     async fn stats(&self, ctx: &Context<'_>) -> async_graphql::Result<Stats> {
         use std::collections::BTreeMap;
         let st = state(ctx);
-        let records = st.backend.load_all().await?;
+        let records = st.backend.load_all().await.map_err(store_error)?;
 
         let mut signed = 0u64;
         let mut ready = 0u64;
@@ -713,33 +793,46 @@ impl Query {
     /// bearer token — deliberately NOT straight from Postgres. This process is
     /// the one exposed to the internet, and a database credential here would
     /// bypass every scope in `bridge_core::auth`. Needs `--store-url`.
+    ///
+    /// One page: `limit` rows (default 50, at most 200) from `offset` (default
+    /// 0), applied after `filter`.
+    #[graphql(complexity = "page_size(limit) * child_complexity")]
     async fn history(
         &self,
         ctx: &Context<'_>,
         filter: Option<HistoryFilter>,
+        limit: Option<u64>,
+        offset: Option<u64>,
     ) -> async_graphql::Result<Vec<HistoryEntry>> {
         let f = filter.unwrap_or_default();
-        let rows = state(ctx).backend.history().await?;
-        Ok(rows
+        let rows = state(ctx).backend.history().await.map_err(store_error)?;
+        let rows: Vec<HistoryEntry> = rows
             .into_iter()
             .filter(|r| f.chain_id_from.is_none_or(|c| r.chain_id_from == c))
             .filter(|r| f.chain_id_to.is_none_or(|c| r.chain_id_to == c))
             .filter(|r| f.stuck_only.is_none_or(|want| r.stuck == want))
             .filter(|r| f.submission_id.as_deref().is_none_or(|id| r.submission_id.eq_ignore_ascii_case(id)))
             .map(Into::into)
-            .collect())
+            .collect();
+        Ok(paginate(rows, limit, offset))
     }
 
     /// Same-chain swap history (`SwapPool.Swapped`), mirrored by the `indexer`.
     /// Newest first, optionally scoped to one chain. Served over the sig-store's
     /// read scope for the reason `history` documents. Needs `--store-url`.
+    /// `limit` defaults to 50 and is capped at 200.
+    #[graphql(complexity = "page_size(limit) * child_complexity")]
     async fn swap_history(
         &self,
         ctx: &Context<'_>,
         chain_id: Option<u64>,
         limit: Option<u64>,
     ) -> async_graphql::Result<Vec<SwapHistoryEntry>> {
-        let rows = state(ctx).backend.swaps(chain_id, limit.unwrap_or(100)).await?;
+        let rows = state(ctx)
+            .backend
+            .swaps(chain_id, page_size(limit) as u64)
+            .await
+            .map_err(store_error)?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 }
@@ -802,7 +895,136 @@ impl Mutation {
             cancel_signatures: Vec::new(),
             refund_signatures: Vec::new(),
         };
-        let merged = st.backend.upsert(record, sig).await?;
+        let merged = st.backend.upsert(record, sig).await.map_err(store_error)?;
         Ok(Submission::from_record(merged, st.threshold))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn page_size_defaults_and_caps() {
+        assert_eq!(page_size(None), DEFAULT_PAGE as usize);
+        assert_eq!(page_size(Some(0)), 1, "zero is not a way to ask for everything");
+        assert_eq!(page_size(Some(7)), 7);
+        assert_eq!(page_size(Some(u64::MAX)), MAX_PAGE as usize);
+        assert_eq!(page_size(Some(MAX_PAGE + 1)), MAX_PAGE as usize);
+    }
+
+    /// M-8: with no args a caller gets the first DEFAULT_PAGE rows — never the
+    /// whole table.
+    #[test]
+    fn paginate_windows_the_list() {
+        let rows: Vec<u64> = (0..1000).collect();
+        assert_eq!(paginate(rows.clone(), None, None).len(), DEFAULT_PAGE as usize);
+        assert_eq!(paginate(rows.clone(), Some(10_000), None).len(), MAX_PAGE as usize);
+        assert_eq!(paginate(rows.clone(), Some(3), Some(5)), vec![5, 6, 7]);
+        assert!(paginate(rows.clone(), Some(3), Some(5_000)).is_empty(), "offset past the end");
+        assert_eq!(paginate(rows, Some(5), Some(998)), vec![998, 999], "short last page");
+    }
+
+    /// The `chains` query must never carry the private endpoint (H-4).
+    #[test]
+    fn chain_view_serves_only_the_public_rpc() {
+        let info = ChainInfo {
+            chain_id: 1,
+            name: "x".into(),
+            rpc_url: Some("https://provider.example/v2/SECRETKEY".into()),
+            public_rpc_url: Some("https://rpc.public.example".into()),
+            gate: None,
+            token: None,
+            tokens: vec![],
+            router: None,
+            swap_pool: None,
+        };
+        let view = Chain::from(info.clone());
+        assert_eq!(view.rpc_url.as_deref(), Some("https://rpc.public.example"));
+
+        let view = Chain::from(ChainInfo { public_rpc_url: None, ..info });
+        assert_eq!(view.rpc_url, None, "no public URL => null, never the private one");
+    }
+
+    /// A store transport failure must not leak the store's address to clients.
+    #[tokio::test]
+    async fn remote_errors_are_replaced_by_a_generic_message() {
+        // A real transport error: port 1 on loopback refuses the connection.
+        // reqwest's Display for it names the URL — exactly what used to reach
+        // the client's `errors[]`.
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:1/internal-store/history")
+            .send()
+            .await
+            .unwrap_err();
+        let inner = bridge_core::remote::RemoteError::Http(err);
+        let e = anyhow::Error::from(inner).context("history");
+        assert!(e.to_string().contains("history"), "premise: detail exists: {e}");
+        assert!(format!("{e:?}").contains("internal-store"), "premise: the URL is in the detail");
+
+        let msg = store_error(e).message;
+        assert_eq!(msg, "signature store unavailable");
+        assert!(!msg.contains("internal-store"));
+    }
+
+    /// The complexity multiplier is what turns `limit_complexity` into a bound
+    /// on `eth_call` fan-out. Before: `{ submissions { executed cancelled
+    /// status } }` had complexity 4 whatever the table size.
+    #[tokio::test]
+    async fn list_complexity_scales_with_page_size_and_chain_reads() {
+        let dir = std::env::temp_dir().join(format!("graphql-api-complexity-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = ApiState {
+            backend: Arc::new(StoreBackend::file(&dir).unwrap()),
+            threshold: Some(2),
+            chains: Chains::new(),
+            registry: vec![],
+            swaps: Swaps::new(),
+        };
+        let schema = async_graphql::Schema::build(
+            Query,
+            async_graphql::EmptyMutation,
+            async_graphql::EmptySubscription,
+        )
+        .limit_complexity(8000)
+        .data(state)
+        .finish();
+
+        // 200 rows x (1 + 3 x 20) = 12,200 > 8000: refused before any resolver runs.
+        let res = schema
+            .execute("{ submissions(limit: 200) { submissionId executed cancelled status } }")
+            .await;
+        assert!(!res.errors.is_empty(), "must be refused");
+        assert!(res.errors[0].message.to_lowercase().contains("complex"), "{:?}", res.errors);
+
+        // 200 rows x (1 + 20) = 4,200: admitted (and, on an empty store, empty).
+        let res = schema.execute("{ submissions(limit: 200) { submissionId status } }").await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+
+        // The frontend's exact shape, default page: admitted.
+        let res = schema
+            .execute(
+                "{ submissions { submissionId debridgeId amount chainIdFrom chainIdTo nonce receiver \
+                   nativeSender signatureCount meetsThreshold status signatures { signer } } }",
+            )
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+
+        // `history` and `swapHistory` carry the same multiplier.
+        let res = schema
+            .execute("{ history(limit: 200) { submissionId status swapIntent { tokenIn } } }")
+            .await;
+        // (a dir-backed store has no history; the point is that it got PAST
+        // validation and into the resolver, which errors on the backend.)
+        assert!(res.errors.iter().all(|e| !e.message.to_lowercase().contains("complex")), "{:?}", res.errors);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ...while a store-side validation error (no URL in it) stays informative.
+    #[test]
+    fn store_validation_errors_pass_through() {
+        let e = anyhow::Error::from(bridge_core::store::StoreError::BadField("signer"));
+        let msg = store_error(e).message;
+        assert!(msg.contains("signer"), "got: {msg}");
     }
 }

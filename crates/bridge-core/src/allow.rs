@@ -132,6 +132,12 @@ pub struct SubmissionHistory {
     /// than a plain bridge send, its swap intent/outcome.
     #[serde(default)]
     pub swap_intent: Option<SwapBridgeInfo>,
+    /// The keeper's OWN report of the claim tx it submitted (M-1, audit
+    /// 2026-09-09). Advisory only: `status`/`claim_tx` above come from the
+    /// indexer's on-chain observation, and no queue reads this field. Useful to
+    /// spot a keeper that believes it claimed something the chain never saw.
+    #[serde(default)]
+    pub keeper_claim_tx: Option<String>,
 }
 
 fn default_refund_status() -> String {

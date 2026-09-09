@@ -62,6 +62,7 @@ contract SecurityTest is Test {
 
     function setUp() public {
         gate = deployTestGate(_validators(3), 2);
+        gate.setSupportedChain(CHAIN_TO, true);
         token = new TestToken("Test", "TST");
     }
 

@@ -14,3 +14,8 @@ chrono = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# Live-Postgres tests (tests/live_pg.rs), gated on BRIDGE_TEST_DATABASE_URL.
+alloy = { workspace = true }
+hex = { workspace = true }

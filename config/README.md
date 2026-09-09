@@ -27,10 +27,14 @@ you can redeploy without restarting, or restart without redeploying.
 
 ## `deploy.config.json`
 
-`bash scripts/deploy-from-json.sh [config] [--dry-run] [--no-config-update]`
+`bash scripts/deploy-from-json.sh [config] [--dry-run] [--no-config-update] [--redeploy] [--allow-local-profile-on-chain]`
 
 `--dry-run` validates everything and prints the plan without sending a
 transaction. `--no-config-update` skips patching the runtime config.
+`--allow-local-profile-on-chain` lets the `local` profile run on a chain id that
+is not in the script's `DEV_CHAIN_IDS` allowlist (anvil, Sepolia, Hoodi and the
+other well-known testnets); without it that is refused, because a local-profile
+gate is a hot-key-owned gate with no guardian (M-12).
 
 | field | meaning |
 | --- | --- |
@@ -44,6 +48,8 @@ transaction. `--no-config-update` skips patching the runtime config.
 | `gate.bridge_domain` | the mesh-generation binding, `0x` + 64 hex. Every gate in one generation shares it; a **new** deployment needs a **new** one, or the previous deployment's validator signatures replay against the fresh gates. `"auto"` derives one (local only) |
 | `gate.guardian` | pause button, low trust, must differ from the owner (production) |
 | `gate.owner` | multisig that receives ownership via two-step transfer (production) |
+| `gate.seal` | call `seal()` on every gate once its corridors are registered (default `true`; production refuses `false`). Irreversible: afterwards a **new** corridor needs `scheduleGovernance(setLocalTokenActionId(id, token))` + 48 h — the delay that stops a stolen owner key from draining the gate through a fake corridor (H-1). Anything the deployer can no longer send (a sealed gate, a gate it does not own) is written to `governance_calls` in the output file, `scheduleGovernance` first |
+| `gate.extra_supported_chains[]` | chain ids the gates may `send` to beyond `chains[]` (and the Solana chain id, which is added automatically when `solana.enabled`). `send` reverts `UnsupportedChain` for anything not listed (M-3); every chain in `chains[]` is listed on every other. The script asserts every listing at the end — hard failure under `production` |
 | `chains[]` | `chain_id`, `name`, `rpc_url`; `deploy_gate: false` + `gate` reuses an existing one. The RPC's reported chain id is verified before anything is sent. `"enabled": false` parks a chain in the config — assets and pools that name it are skipped, so an unfunded chain can wait there instead of being deleted and re-added |
 | `assets[].symbol/name/decimals` | the bridgeable asset |
 | `assets[].deployments[]` | `chain_id` + `address`; `"auto"` deploys a fresh `TestToken` (local only) **only if `output.file` has no address recorded for it** — a re-run reuses what the last one produced. Deploying a second token silently rewires the mesh to it and orphans the liquidity in the first, so replacing one is opt-in: `--redeploy`. An explicit address must have contract code on that chain |
@@ -66,10 +72,13 @@ transaction. `--no-config-update` skips patching the runtime config.
 | tokens | `"auto"` TestTokens allowed | real ERC-20 addresses only |
 | test liquidity | allowed | refused |
 | `bridge_domain` | `"auto"` allowed | must be pinned |
-| corridors | sent by the deployer | **not sent** — after the handover only the owner may call `setLocalToken`, so the calldata is written to `governance_calls` in the output file for the multisig to execute |
+| chain ids | dev/testnet allowlist only (or `--allow-local-profile-on-chain`) | any |
+| wiring | `setSupportedChain` per peer → `setLocalToken` per corridor → `seal()`, sent by the deployer | the same, sent by the deployer **while it is still the transient owner** (the handover is two-step and completes only on `acceptOwnership()`). Whatever it can no longer send — a gate it does not own, a corridor on an already-sealed gate — goes to `governance_calls` in the output file, `scheduleGovernance` first |
+| post-checks | every peer listed; sealed if `gate.seal` | **hard failure** unless every gate `isSealed()` and lists every peer — do not fund a gate that failed here |
+| Solana owner | payer | `solana.init.owner` required, must equal the payer, plus `init.guardian` |
 
 After a production run the multisig must `acceptOwnership()` on every gate, then
-execute `governance_calls`.
+execute any `governance_calls` in order.
 
 ### the Solana leg
 
@@ -83,12 +92,13 @@ submissionId computed on one side verify on the other.
 | --- | --- |
 | `chain_id` | deBridge's id for Solana (`7565164`). Not a Solana concept — it is the value hashed into every submissionId, and both sides must agree |
 | `rpc` / `cluster` | endpoint and a label for the log line |
-| `payer_keypair` | the fee payer. It signs `solana program deploy` and every governance instruction, **and it becomes the gate's owner** — `init` requires the program's upgrade authority, and there is no ownership-transfer instruction on this side, unlike the EVM gate's two-step handover. Whichever key deploys the program governs it |
+| `payer_keypair` | the fee payer. It signs `solana program deploy` and every governance instruction, **and it becomes the gate's owner** — `init` requires the program's upgrade authority, and there is no ownership-transfer instruction on this side, unlike the EVM gate's two-step handover. Whichever key deploys the program governs it, for good |
+| `init.owner` | the pubkey that is to own the gate — i.e. the multisig-controlled key. **Production requires it, requires it to equal the payer** (there is no handover, so the init signer *is* the owner) and refuses to run otherwise; a mismatch against an already-initialized program's owner is fatal too. Owner actions that widen trust (`set-validator` add, `set-threshold` lower) sit behind `gate-admin schedule-governance <action-id>` + 48 h (H-2); `governance-status` lists what is pending, `cancel-governance` (owner or guardian) drops it. Move the program's upgrade authority behind the same multisig/timelock (`solana program set-upgrade-authority`) — the script warns while it is the payer |
 | `gate_admin_bin` / `build` | the `gate-admin` client. It lives in the `solana-relayer` crate — its own cargo project, because `solana-client` pins `zeroize <1.4` and alloy needs `^1.5`, so no EVM-side crate can host it |
 | `program.deploy` / `program.program_id` / `program.so_path` | deploy `solana_gate.so` (build it with `scripts/testing/build-solana.sh`) or reuse a deployed program |
 | `program.use_rpc` | send the deploy's write transactions over JSON-RPC instead of the leader's TPU. Leave it on for hosted endpoints and containerised validators: the TPU path needs gossip reachability and otherwise stalls 20s and fails |
 | `init.run` | initialize the gate if it is not already. Re-running is safe — the script reads the on-chain config first and leaves an initialized gate alone |
-| `init.guardian` | pause-only key (may pause, not unpause), as on the EVM side |
+| `init.guardian` | pause-only key (may pause, not unpause), as on the EVM side. Required under `production`, must differ from `init.owner` |
 | `init.max_validators` / `max_corridors` | the config account is sized for these at init and both vectors are refused growth past them, so it can never outgrow its buffer |
 | `register_corridors` | register every EVM chain in `chains[]` as a destination. `send` refuses any `chain_id_to` governance has not registered; the instruction is idempotent |
 | `assets[].mint` / `.vault` | the SPL mint and the program-owned vault. **Supplied, never created here** — the vault must be an SPL account for that mint, owned by the program's `vault_authority` PDA, with no delegate and no close authority (the program rejects anything else) |
@@ -147,14 +157,15 @@ them).
 | field | meaning |
 | --- | --- |
 | `threshold` | signatures a claim needs; must match the deployed gates |
-| `runtime.run_dir` | generated configs, logs, pid file, validator cursors. Keep it OUT of `/tmp` for anything long-running: `systemd-tmpfiles-clean` sweeps `/tmp` daily, and losing a validator's cursor means it restarts from `start_block` — on a live chain that is a backlog it may take hours to crawl back through |
+| `runtime.run_dir` | generated configs, logs, pid file, validator cursors, `tokens.env`. Default (`null`): `${XDG_STATE_HOME:-~/.local/state}/selendra-bridge/<name>`. Created 0700 with every file 0600 (M-11: the TOMLs carry private keys). Keep it OUT of `/tmp` for anything long-running: `systemd-tmpfiles-clean` sweeps `/tmp` daily, and losing a validator's cursor means it restarts from `start_block` — on a live chain that is a backlog it may take hours to crawl back through |
 | `runtime.bin_dir` | where the compiled services are (`target/debug`, `target/release`, …) |
 | `runtime.build` | `cargo build` the services first |
-| `database.url` | Postgres for the sig-store + indexer |
-| `database.docker` | run that Postgres as a container. `--stop` removes the container but **keeps** the volume: it holds signatures, history and indexer cursors, and validators resume from file cursors rather than re-signing blocks they already scanned |
+| `database.url` | Postgres for the sig-store + indexer. Required when `database.docker.enabled` is `false`; otherwise **derived** from the docker fields below (leave it `null`) |
+| `database.docker` | run that Postgres as a container, published on `127.0.0.1:<port>` only (M-10: a docker `-p` publish bypasses ufw). `password: null` means a random one per run dir, kept in `run_dir/tokens.env` (0600) and re-applied to the volume on every start; a configured password wins (and `"bridge"` earns a warning). `--stop` removes the container but **keeps** the volume: it holds signatures, history and indexer cursors, and validators resume from file cursors rather than re-signing blocks they already scanned |
 | `sig_store.tokens` | scoped credentials, one per role. With none set the store runs **unauthenticated** — signatures, claim status and the allowlist become writable by anything that can reach the port. `generate_if_unset` mints a random one per role per run into `run_dir/tokens.env` |
 | `defaults` | per-chain fallbacks for `poll_interval_ms`, `max_block_range`, `start_block`, `block_confirmation`, `allow_zero_confirmation` |
-| `chains[].rpcs` | ordered endpoints; validators fail over to the next on error |
+| `chains[].rpcs` | ordered endpoints; validators fail over to the next on error. `rpcs[0]` is also what the API and relayers use server-side — it is **never** served to a browser |
+| `chains[].public_rpc` | the browser-safe (keyless) endpoint the GraphQL registry serves as `rpcUrl` (H-4). Unset: a loopback `rpcs[0]` is served as-is; anything else is served as `null` (the UI reads through the wallet's provider instead) with a warning at generation, and `graphql-api --production` refuses to start without it |
 | `chains[].gate` | the **proxy** address (never the implementation) |
 | `chains[].source` / `.destination` | which roles this chain plays. Both `true` = full mesh, which is the normal case |
 | `chains[].start_block` | scan floor. `0` re-scans a live chain's entire history; the deploy script sets each chain's deploy block for you |
@@ -168,7 +179,7 @@ them).
 | `solana` | the Solana relayers — see below; `enabled: false` skips them |
 | `indexer` | history + refund eligibility sweep; the only writer of `refund_status`. EVM chains only — it speaks EVM JSON-RPC, so a transfer **delivered on Solana** is recorded as `stuck` / `refund_status: eligible` forever: the `Sent` is on an EVM chain it watches, the `Claimed` is not. Nothing acts on that nomination (an EVM validator never attests for a destination outside its `refund.destinations`, and the relayer re-reads the Solana gate before attesting), but the UI will show those transfers as stuck |
 | `frontend` | the vite dev server for the UI. It reaches the API through vite's proxy (`VITE_PROXY_TARGET`), so the API needs no CORS and no public port. `node_bin` pins a toolchain when node is not on PATH — an nvm install usually isn't; leave it `null` to auto-detect the newest one |
-| `graphql.swaps[]` | one entry per pool (`chain_id`, `pool`, `from_block`), so a multi-chain mesh serves a Swap view on every chain. Each is passed to the API with that chain's own `max_block_range`: the `eth_getLogs` cap is a property of the endpoint, and on a fast chain the strictest cap in the mesh is not merely slow but fatal — a pool on 0.2s blocks produces them faster than a 10-block chunk can replay, so its token list never finishes backfilling. `graphql.swap` is the older single-pool form and still works |
+| `graphql.swaps[]` | one entry per pool (`chain_id`, `pool`, `from_block`), so a multi-chain mesh serves a Swap view on every chain. Each becomes that chain's `swap_pool` in the registry file (read over the chain's own `rpc_url`, with its own `max_block_range`: the `eth_getLogs` cap is a property of the endpoint, and on a fast chain the strictest cap in the mesh is not merely slow but fatal — a pool on 0.2s blocks produces them faster than a 10-block chunk can replay, so its token list never finishes backfilling). Nothing goes on the API's command line. `graphql.swap` is the older single-pool form and still works |
 | `graphql` | the read API the frontend talks to. It holds no database credential — it reads history through the sig-store on its reader token, because it is the only service meant to face the internet |
 
 
@@ -186,7 +197,8 @@ Solana-origin transfers into the same sig-store the EVM validators use, and
 | `relayers[]` | one process per validator key. Each holds the **same secp256k1 key** that validator uses on the EVM side — one validator set attests for both VMs. Only `private_key` / `private_key_env` are supported here (no keystore) |
 | `relayers[].deliver` | run the claim-submitting half. `payer_keypair` pays fees and rent and carries no bridge authority — the validator signatures do |
 | `tokens[]` | symbol → mint, for the record and for the optional UI listing |
-| `include_in_registry` | list Solana in the GraphQL registry the UI reads. Off by default: the API registers `rpc_url`+`gate` chains for on-chain `executed` lookups and speaks EVM JSON-RPC only, so a Solana row is listed, never polled |
+| `include_in_registry` | **no longer gates anything**: when the leg is enabled the Solana row is always in the GraphQL registry, with `gate` = the base58 program id and `rpc_url` = `solana.rpc` — that is how the API reads the gate (corridor nonce, vault) and the Solana swap pool; it routes on address form (0x = EVM, base58 = Solana). `public_rpc` (browser-safe) is served as its `rpcUrl`; `solana.rpc` never is |
+| `refund` (top level) | when enabled, every relayer also gets a `[refund]` block: the same `timeout_secs` as the validators and one `[[refund.evm]]` reader per EVM gate (`rpc_env = "RPC_<chain_id>"`, so a keyed url lives in the process environment, not the file; `block_confirmation` is the refund one, floored at 1). Without it the attester votes REFUND but never CANCEL, and a stranded EVM→Solana transfer is never released (M-13). The program and the relayer must be deployed together: `SentRecord` grew by 8 bytes (legacy records still decode) |
 | `bin` / `build` | the relayer binary (its own cargo project — see above) |
 
 **Run at least `threshold` relayers, each with a distinct key.** Solana `Sent`
@@ -229,8 +241,13 @@ bash scripts/bridge-from-json.sh config/my.bridge.json --compose
 cd docker/my-mesh && docker compose up -d --build
 ```
 
-Re-running keeps an existing `.env`, so regenerating after a config change does
-not rotate the Postgres password out from under a live volume.
+Re-running keeps the secrets in an existing `.env`, so regenerating after a
+config change does not rotate the Postgres password out from under a live
+volume; the `RPC_<chain_id>` / `RPC_SOLANA` lines are refreshed from the config
+each time. The compose file references every RPC url as `${RPC_<chain>}` and
+never inlines one — a keyed url in the compose file is what leaked in H-4, which
+is why `docker/*/docker-compose.yml` is gitignored as generated output (only
+`.env.example` in a generated stack is committable).
 
 What differs from the host-run form, and why:
 

@@ -19,6 +19,32 @@ use std::collections::BTreeMap;
 use base64::Engine;
 use swap_math::{PoolState, TokenState, POOL_SPACE, TOKEN_SPACE};
 
+use crate::chain::http_client;
+
+/// A caller-supplied Solana public key: base58 that decodes to exactly 32
+/// bytes. Returns the trimmed input so the exact accepted bytes are what gets
+/// forwarded.
+pub fn valid_pubkey(s: &str) -> anyhow::Result<&str> {
+    let t = s.trim();
+    // Base58 of 32 bytes is 32..=44 chars; reject anything else before decoding
+    // so an oversized string cannot even reach the decoder.
+    anyhow::ensure!(
+        (32..=44).contains(&t.len()) && from_b58(t).is_some(),
+        "not a base58 Solana public key"
+    );
+    Ok(t)
+}
+
+/// A caller-supplied Solana transaction signature: base58 that decodes to
+/// exactly 64 bytes (87..=88 chars).
+pub fn valid_signature(s: &str) -> anyhow::Result<&str> {
+    let t = s.trim();
+    anyhow::ensure!((87..=88).contains(&t.len()), "not a base58 Solana signature");
+    let bytes = bs58::decode(t).into_vec().map_err(|_| anyhow::anyhow!("not a base58 Solana signature"))?;
+    anyhow::ensure!(bytes.len() == 64, "not a base58 Solana signature");
+    Ok(t)
+}
+
 /// A configured Solana pool: an RPC endpoint and the program that owns it.
 #[derive(Clone, Debug)]
 pub struct SolanaPool {
@@ -36,6 +62,66 @@ pub struct SolanaPool {
 pub struct Snapshot {
     pub pool: PoolState,
     pub tokens: Vec<TokenState>,
+}
+
+/// Why a snapshot could not quote a swap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuoteError {
+    /// One leg is not a listed token of this pool.
+    UnknownToken,
+    /// One leg's price is older than the pool's `max_price_age` — the program
+    /// would reject the swap with `StalePrice`, so no quote is offered. Carries
+    /// the base58 mint whose price is stale.
+    StalePrice { mint: String },
+    /// The arithmetic overflowed or a price is zero.
+    Math,
+}
+
+impl std::fmt::Display for QuoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuoteError::UnknownToken => write!(f, "token is not listed on this pool"),
+            QuoteError::StalePrice { mint } => {
+                write!(f, "price for {mint} is stale; the program would refuse this swap (StalePrice)")
+            }
+            QuoteError::Math => write!(f, "quote does not compute (zero price or overflow)"),
+        }
+    }
+}
+
+impl Snapshot {
+    /// The pegged output for `amount` of `mint_in` into `mint_out` at `now`
+    /// (unix seconds), computed with the program's own `swap-math` AND its own
+    /// staleness guard (`PoolState::price_is_fresh`). A leg the chain would
+    /// refuse as `StalePrice` is refused here too, so the UI never shows a
+    /// number the transaction cannot honour.
+    pub fn quote(
+        &self,
+        mint_in: &[u8; 32],
+        mint_out: &[u8; 32],
+        amount: u64,
+        now: i64,
+    ) -> Result<u64, QuoteError> {
+        let ti = self.tokens.iter().find(|t| t.mint == *mint_in).ok_or(QuoteError::UnknownToken)?;
+        let to = self.tokens.iter().find(|t| t.mint == *mint_out).ok_or(QuoteError::UnknownToken)?;
+        for leg in [ti, to] {
+            if !self.pool.price_is_fresh(leg, now) {
+                return Err(QuoteError::StalePrice { mint: b58(&leg.mint) });
+            }
+        }
+        swap_math::amount_out(amount, ti.price, ti.decimals, to.price, to.decimals, self.pool.fee_bps)
+            .ok_or(QuoteError::Math)
+    }
+}
+
+/// Wall-clock unix seconds — the off-chain stand-in for the cluster `Clock`
+/// the program reads. The two drift by at most a slot or two, far inside any
+/// sane `max_price_age`.
+pub fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl SolanaPool {
@@ -104,7 +190,7 @@ impl SolanaPool {
             "params": [addrs, {"encoding": "base64", "commitment": "confirmed"}],
         });
         let resp: serde_json::Value =
-            reqwest::Client::new().post(&self.rpc).json(&body).send().await?.json().await?;
+            http_client().post(&self.rpc).json(&body).send().await?.json().await?;
         if let Some(err) = resp.get("error") {
             anyhow::bail!("getMultipleAccounts failed: {err}");
         }
@@ -130,7 +216,7 @@ impl SolanaPool {
             "method": "getProgramAccounts",
             "params": [self.program, {"encoding": "base64", "commitment": "confirmed"}],
         });
-        let resp: serde_json::Value = reqwest::Client::new()
+        let resp: serde_json::Value = http_client()
             .post(&self.rpc)
             .json(&body)
             .send()
@@ -209,7 +295,7 @@ impl SolanaPool {
             "params": [{"commitment": "finalized"}],
         });
         let resp: serde_json::Value =
-            reqwest::Client::new().post(&self.rpc).json(&body).send().await?.json().await?;
+            http_client().post(&self.rpc).json(&body).send().await?.json().await?;
         if let Some(err) = resp.get("error") {
             anyhow::bail!("getLatestBlockhash failed: {err}");
         }
@@ -222,12 +308,17 @@ impl SolanaPool {
     /// Confirmation state of a signature: `confirmed`, `finalized`, `failed`,
     /// or `pending` while the cluster has not seen it yet.
     pub async fn signature_status(&self, signature: &str) -> anyhow::Result<String> {
+        // Caller-supplied: validate the SHAPE before it is spliced into a
+        // request to the operator's (keyed) RPC. Anything else is refused here,
+        // not forwarded for the upstream to reject — a proxy that relays
+        // arbitrary strings is an oracle for probing the endpoint behind it.
+        let signature = valid_signature(signature)?;
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "getSignatureStatuses",
             "params": [[signature], {"searchTransactionHistory": true}],
         });
         let resp: serde_json::Value =
-            reqwest::Client::new().post(&self.rpc).json(&body).send().await?.json().await?;
+            http_client().post(&self.rpc).json(&body).send().await?.json().await?;
         if let Some(err) = resp.get("error") {
             anyhow::bail!("getSignatureStatuses failed: {err}");
         }
@@ -247,12 +338,14 @@ impl SolanaPool {
     /// reads it, so a wrong answer here can mislead a balance display but can
     /// never redirect funds.
     pub async fn token_balance(&self, account: &str) -> anyhow::Result<String> {
+        // Caller-supplied — see `signature_status`.
+        let account = valid_pubkey(account)?;
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountBalance",
             "params": [account, {"commitment": "confirmed"}],
         });
         let resp: serde_json::Value =
-            reqwest::Client::new().post(&self.rpc).json(&body).send().await?.json().await?;
+            http_client().post(&self.rpc).json(&body).send().await?.json().await?;
         // A missing account is "no balance", not an error: a user who has never
         // held this mint simply has no associated account yet.
         if resp.get("error").is_some() {
@@ -391,6 +484,85 @@ mod tests {
     fn base58_round_trips() {
         let key = [7u8; 32];
         assert_eq!(from_b58(&b58(&key)), Some(key));
+    }
+
+    #[test]
+    fn caller_strings_must_be_well_formed_before_they_reach_the_rpc() {
+        // 32 bytes -> pubkey shape.
+        let pk = b58(&[7u8; 32]);
+        assert!(valid_pubkey(&pk).is_ok());
+        assert!(valid_pubkey(&format!("  {pk} ")).is_ok(), "whitespace trimmed");
+        assert!(valid_pubkey("").is_err());
+        assert!(valid_pubkey("not base58 0OIl").is_err());
+        assert!(valid_pubkey(&bs58::encode([1u8; 31]).into_string()).is_err(), "31 bytes");
+        assert!(valid_pubkey(&bs58::encode([1u8; 33]).into_string()).is_err(), "33 bytes");
+        assert!(valid_pubkey(&"1".repeat(45)).is_err(), "too long");
+        // A signature is not a pubkey and vice versa.
+        let sig = bs58::encode([9u8; 64]).into_string();
+        assert!(valid_pubkey(&sig).is_err());
+        assert!(valid_signature(&sig).is_ok());
+        assert!(valid_signature(&pk).is_err());
+        assert!(valid_signature(&bs58::encode([9u8; 63]).into_string()).is_err());
+        assert!(valid_signature(&"A".repeat(5000)).is_err(), "no oversized strings to the decoder");
+        // JSON/URL metacharacters never make it through.
+        assert!(valid_pubkey("\"},\"method\":\"x").is_err());
+    }
+
+    fn snap(max_price_age: i64) -> Snapshot {
+        let hub = [1u8; 32];
+        let alt = [2u8; 32];
+        let pool = PoolState { hub_mint: hub, fee_bps: 0, max_price_age, ..Default::default() };
+        let tokens = vec![
+            TokenState {
+                mint: hub,
+                decimals: 6,
+                price: swap_math::PRICE_ONE,
+                listed: true,
+                price_set_at: 0, // hub: pinned, never stamped, always fresh
+                ..Default::default()
+            },
+            TokenState {
+                mint: alt,
+                decimals: 6,
+                price: 2 * swap_math::PRICE_ONE,
+                listed: true,
+                price_set_at: 1_000,
+                ..Default::default()
+            },
+        ];
+        Snapshot { pool, tokens }
+    }
+
+    /// The quote applies the program's staleness guard: a leg the chain would
+    /// refuse with `StalePrice` gets no number here either.
+    #[test]
+    fn quote_refuses_a_stale_leg_exactly_as_the_program_does() {
+        let s = snap(100);
+        let (hub, alt) = ([1u8; 32], [2u8; 32]);
+
+        // Inside the window: 1_000 + 100 is the last fresh second.
+        assert_eq!(s.quote(&hub, &alt, 2_000_000, 1_100), Ok(1_000_000));
+        assert_eq!(s.quote(&alt, &hub, 1_000_000, 1_100), Ok(2_000_000));
+        // One second past it: both directions refuse, naming the stale leg.
+        let stale = Err(QuoteError::StalePrice { mint: b58(&alt) });
+        assert_eq!(s.quote(&hub, &alt, 2_000_000, 1_101), stale);
+        assert_eq!(s.quote(&alt, &hub, 1_000_000, 1_101), stale);
+        // The hub is always fresh: hub->hub quotes at any time.
+        assert!(s.quote(&hub, &hub, 5, i64::MAX).is_ok());
+        // Unknown leg.
+        assert_eq!(s.quote(&hub, &[9u8; 32], 1, 1_100), Err(QuoteError::UnknownToken));
+    }
+
+    /// A pool from before `max_price_age` existed decodes as 0 and must use the
+    /// DEFAULT bound, not "disabled" — the same rule `swap-math` applies.
+    #[test]
+    fn unconfigured_max_price_age_uses_the_default_not_infinity() {
+        let s = snap(0);
+        let (hub, alt) = ([1u8; 32], [2u8; 32]);
+        let bound = s.pool.effective_max_price_age();
+        assert!(bound > 0);
+        assert!(s.quote(&hub, &alt, 1_000_000, 1_000 + bound).is_ok());
+        assert!(matches!(s.quote(&hub, &alt, 1_000_000, 1_001 + bound), Err(QuoteError::StalePrice { .. })));
     }
 
     #[test]

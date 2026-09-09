@@ -69,7 +69,12 @@ async fn main() -> anyhow::Result<()> {
     let mut runtimes: BTreeMap<u64, Arc<Mutex<Runtime>>> = BTreeMap::new();
     for source in &cfg.sources {
         let state_path = PathBuf::from(&source.state_file);
-        let runtime = Arc::new(Mutex::new(Runtime::load_or_init(&state_path, source.start_block)?));
+        // A corrupt state file is a hard error here (see `Runtime::load_or_init`):
+        // it may hold a persisted safety stop, and coming up "fresh" would clear it.
+        let runtime = Arc::new(Mutex::new(
+            Runtime::load_or_init(&state_path, source.start_block)
+                .with_context(|| format!("loading scanner state for chain {}", source.chain_id))?,
+        ));
         runtimes.insert(source.chain_id, runtime);
     }
     let runtimes = Arc::new(runtimes);
@@ -186,6 +191,7 @@ async fn scan_source(
         gate = %gate,
         bridge_domain = %bridge_domain,
         chain_id = source.chain_id,
+        // Redacted to scheme+host by `Failover`: hosted RPC keys live in the path.
         rpc = %failover.active_url(),
         endpoints = endpoints.len(),
         resume_from,
@@ -231,25 +237,48 @@ async fn scan_source(
 
         if confirmed >= from_block {
             let to_block = confirmed.min(from_block + source.max_block_range - 1);
-            // True when the window was capped by `max_block_range`, i.e. there is
-            // more ALREADY-CONFIRMED history waiting right now. See the catch-up
-            // note where this is consumed.
-            let behind = to_block < confirmed;
 
-            let filter = Filter::new()
-                .address(gate)
-                .event_signature(sent_sig)
-                .from_block(from_block)
-                .to_block(to_block);
+            // Address/topic selection only — the block range is applied by
+            // `get_logs_confirmed`, against the head of the endpoint that serves
+            // the call. `cached_latest` above may have come from a DIFFERENT
+            // endpoint (failover rotates between calls); a lagging node would
+            // return no logs for blocks it has not seen, the call would succeed,
+            // and the cursor would move past transfers nobody signed. So the
+            // window is clamped per endpoint and the cursor only ever advances
+            // to `scanned_to` — what was actually read — never to `to_block`.
+            let filter = Filter::new().address(gate).event_signature(sent_sig);
 
-            let mut logs = match failover.get_logs(&filter).await {
-                Ok(v) => v,
+            let (mut logs, scanned_to) = match failover
+                .get_logs_confirmed(&filter, from_block, to_block, source.block_confirmation)
+                .await
+            {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    // The endpoint that answered has nothing confirmed at
+                    // `from_block` yet: it lags the head we cached from another.
+                    // Nothing was scanned, so nothing advances; re-read the head
+                    // next tick rather than trusting the stale cache.
+                    warn!(
+                        chain_id = source.chain_id,
+                        rpc = %failover.active_url(),
+                        from_block,
+                        cached_head = latest,
+                        "serving RPC lags the cached head; not advancing the cursor"
+                    );
+                    cached_latest = None;
+                    tokio::time::sleep(retry).await;
+                    continue;
+                }
                 Err(e) => {
                     warn!(chain_id = source.chain_id, error = %e, "get_logs failed; retrying");
                     tokio::time::sleep(retry).await;
                     continue;
                 }
             };
+            // True when there is more ALREADY-CONFIRMED history waiting right now:
+            // the window was capped by `max_block_range`, or shortened by a lagging
+            // endpoint. See the catch-up note where this is consumed.
+            let behind = scanned_to < confirmed;
             // Process in chain order so nonce sequencing is meaningful.
             logs.sort_by_key(|l| (l.block_number.unwrap_or(0), l.log_index.unwrap_or(0)));
 
@@ -334,8 +363,9 @@ async fn scan_source(
                 // the block cursor still points. See `nonces_before` above.
                 rt.restore_nonces(nonces_before);
             } else {
-                // Advance the cursor only after the whole batch is durably handled.
-                rt.persist.last_block = to_block;
+                // Advance the cursor only after the whole batch is durably handled,
+                // and only as far as the serving endpoint actually scanned.
+                rt.persist.last_block = scanned_to;
             }
             if let Err(e) = rt.save() {
                 warn!(chain_id = source.chain_id, error = %e, "failed to persist scanner state");

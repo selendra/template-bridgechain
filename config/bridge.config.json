@@ -3,13 +3,13 @@
   "name": "local-mesh",
   "threshold": 2,
   "runtime": {
-    "run_dir": "/tmp/bridge-json-run",
+    "run_dir": null,
     "bin_dir": "target/debug",
     "build": true,
     "log_level": "info"
   },
   "database": {
-    "url": "postgres://bridge:bridge@127.0.0.1:5433/bridge?sslmode=disable",
+    "url": null,
     "docker": {
       "enabled": true,
       "container": "bridge-json-pg",
@@ -17,7 +17,7 @@
       "port": 5433,
       "volume": "bridge-json-pg-data",
       "user": "bridge",
-      "password": "bridge",
+      "password": null,
       "db": "bridge"
     }
   },
@@ -63,7 +63,8 @@
           "symbol": "TST",
           "address": "0x0000000000000000000000000000000000000000"
         }
-      ]
+      ],
+      "public_rpc": null
     },
     {
       "chain_id": 1338,
@@ -87,7 +88,8 @@
           "symbol": "TST",
           "address": "0x0000000000000000000000000000000000000000"
         }
-      ]
+      ],
+      "public_rpc": null
     }
   ],
   "validators": [
@@ -184,7 +186,8 @@
     "swap": {
       "program_id": null,
       "tokens": []
-    }
+    },
+    "public_rpc": null
   },
   "indexer": {
     "enabled": true,

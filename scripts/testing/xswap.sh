@@ -93,6 +93,9 @@ STABLE_B=$STABLE; TT=$ALT; POOL_B=$POOL; GATE_B=$GATE; ROUTER_B=$ROUTER
 echo "  stableB=$STABLE_B TT=$TT poolB=$POOL_B gateB=$GATE_B routerB=$ROUTER_B"
 
 echo "=== wire corridor A<->B ==="
+# M-3: each gate must list the peer before `send` (and so swapAndBridge) works.
+cast send "$GATE_A" "setSupportedChain(uint256,bool)" $CHAIN_B true --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
+cast send "$GATE_B" "setSupportedChain(uint256,bool)" $CHAIN_A true --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 cast send "$ROUTER_A" "setRemoteRouter(uint256,bytes)" $CHAIN_B "$ROUTER_B" --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
 cast send "$ROUTER_B" "setRemoteRouter(uint256,bytes)" $CHAIN_A "$ROUTER_A" --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 
@@ -101,6 +104,9 @@ PREFIX=$(printf '%064x' $CHAIN_A)
 DEBRIDGE_ID=$(cast keccak "0x${PREFIX}${STABLE_A#0x}")
 echo "  debridgeId(stable A->B)=$DEBRIDGE_ID"
 cast send "$GATE_B" "setLocalToken(bytes32,address)" "$DEBRIDGE_ID" "$STABLE_B" --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
+# H-1: wiring done — seal both gates before funding, as production does.
+cast send "$GATE_A" "seal()" --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
+cast send "$GATE_B" "seal()" --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 # pre-fund gate B with target-side stable liquidity for the claim
 cast send "$STABLE_B" "mint(address,uint256)" "$GATE_B" 10000000000000 --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 

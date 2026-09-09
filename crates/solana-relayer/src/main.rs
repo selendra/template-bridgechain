@@ -53,10 +53,12 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Destination-side refund attester. Without it an EVM -> Solana transfer that
-    // cannot be delivered is burnable and refundable only by hand: the EVM
-    // validators cannot read Solana, so nobody votes on the corridor.
-    let attester = refund::Attester::new(&cfg.source, key, signer_address, sig_store())?;
+    // Refund attester for both Solana corridors (EVM->Solana and, since audit
+    // round 4, Solana->EVM). Without it a transfer that cannot be delivered is
+    // burnable and refundable only by hand: the EVM validators cannot read
+    // Solana, so nobody else votes on these corridors.
+    let attester =
+        refund::Attester::new(&cfg.source, cfg.refund.as_ref(), key, signer_address, sig_store())?;
 
     let scanner = source::Scanner::new(cfg.source, key, sig_store())?;
     info!(validator = %scanner.signer_address(), "solana-relayer started");

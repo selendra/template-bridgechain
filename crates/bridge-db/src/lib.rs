@@ -97,6 +97,8 @@ struct SubmissionRow {
     refund_tx: Option<String>,
     cancel_tx: Option<String>,
     token: Option<String>,
+    /// The keeper's own report of its claim tx (M-1). Advisory: informs nothing.
+    keeper_claim_tx: Option<String>,
 }
 
 #[derive(FromRow)]
@@ -219,6 +221,7 @@ impl SubmissionRow {
             cancel_signature_count,
             refund_signature_count,
             swap_intent,
+            keeper_claim_tx: self.keeper_claim_tx,
         }
     }
 }
@@ -368,6 +371,57 @@ async fn refuse_if_emptied(
     Ok(())
 }
 
+/// M-2: refuse a NEW signer once a submission already holds
+/// [`store::MAX_SIGNATURES_PER_SUBMISSION`] rows in `kind`'s domain — the same
+/// bound the file store enforces, so the two backends agree.
+///
+/// A re-POST from a signer already on the record is always allowed through (it
+/// is a no-op `ON CONFLICT DO NOTHING`), so an honest validator can never be
+/// locked out of a submission that junk has filled: the cap bounds distinct
+/// signers, not requests. `count_sql`/`present_sql` are literals at every call
+/// site, parameterised on `$1 = id` (and `$2 = signer` for the latter).
+async fn enforce_signature_cap(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    count_sql: &str,
+    present_sql: &str,
+    id: &str,
+    signer_lc: &str,
+    kind: &'static str,
+) -> Result<(), DbError> {
+    let (count,): (i64,) = sqlx::query_as(count_sql).bind(id).fetch_one(&mut **tx).await?;
+    if count < store::MAX_SIGNATURES_PER_SUBMISSION as i64 {
+        return Ok(());
+    }
+    let present: Option<(i32,)> =
+        sqlx::query_as(present_sql).bind(id).bind(signer_lc).fetch_optional(&mut **tx).await?;
+    if present.is_some() {
+        return Ok(());
+    }
+    Err(StoreError::TooManySignatures(kind).into())
+}
+
+/// The lifecycle UPDATE to re-run if [`Db::park_if_missing`] finds the row
+/// appeared under it. `sql` is a literal at every call site.
+struct Retry<'a> {
+    sql: &'static str,
+    arg: &'a str,
+}
+
+/// The columns a parked `pending_lifecycle` marker carries.
+struct Marker<'a> {
+    /// Empty means "leave `status` alone".
+    status: &'a str,
+    claim_tx: Option<&'a str>,
+    cancel_tx: Option<&'a str>,
+    refund_tx: Option<&'a str>,
+    refund_status: Option<&'a str>,
+}
+
+impl Marker<'static> {
+    const NONE: Marker<'static> =
+        Marker { status: "", claim_tx: None, cancel_tx: None, refund_tx: None, refund_status: None };
+}
+
 /// A handle to the bridge database (cheap to clone — wraps a connection pool).
 #[derive(Clone)]
 pub struct Db {
@@ -395,6 +449,15 @@ impl Db {
             }
         }
         Err(DbError::Sqlx(last.expect("loop ran at least once")))
+    }
+
+    /// A handle whose pool connects on first use and applies NO schema.
+    ///
+    /// For tests of the HTTP layer that must reject a request BEFORE touching the
+    /// database (body caps, scope checks): they need an `AppState` but must never
+    /// need Postgres. Not for services — use [`Db::connect`], which migrates.
+    pub fn connect_lazy(url: &str) -> Result<Db, DbError> {
+        Ok(Db { pool: PgPoolOptions::new().max_connections(1).connect_lazy(url)? })
     }
 
     /// Apply the idempotent schema. Safe to call on every startup.
@@ -461,13 +524,32 @@ impl Db {
             insert_submission_row(&mut *tx, &id, &record).await?;
         }
 
+        // M-2: bound the row count BEFORE inserting. Counted inside the same
+        // transaction as the insert so two concurrent writers cannot both read
+        // `cap - 1` and both land; the `SELECT ... FOR UPDATE` on the submission
+        // row serialises them (the row exists by now on either branch above).
+        let signer_lc = sig.signer.to_ascii_lowercase();
+        sqlx::query("SELECT 1 FROM submissions WHERE submission_id = $1 FOR UPDATE")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        enforce_signature_cap(
+            &mut tx,
+            "SELECT COUNT(*)::BIGINT FROM signatures WHERE submission_id = $1",
+            "SELECT 1 FROM signatures WHERE submission_id = $1 AND signer = $2",
+            &id,
+            &signer_lc,
+            "transfer",
+        )
+        .await?;
+
         // Merge the signature, deduped by signer.
         let inserted = sqlx::query(
             "INSERT INTO signatures (submission_id, signer, signature) VALUES ($1,$2,$3) \
              ON CONFLICT (submission_id, signer) DO NOTHING",
         )
         .bind(&id)
-        .bind(sig.signer.to_ascii_lowercase())
+        .bind(&signer_lc)
         .bind(&sig.signature)
         .execute(&mut *tx)
         .await?;
@@ -518,6 +600,20 @@ impl Db {
         let rows: Vec<SubmissionRow> =
             sqlx::query_as("SELECT * FROM submissions ORDER BY created_at").fetch_all(&self.pool).await?;
         self.attach_signatures(rows, false).await
+    }
+
+    /// One page of records (params + signatures), oldest first — the same order
+    /// [`Db::load_all`] uses, so a consumer walking `offset` in steps of `limit`
+    /// sees exactly what one unbounded call would have. Bounds what a single
+    /// `Read`-scoped HTTP request can pull (audit 2026-09-09, item 10).
+    pub async fn load_page(&self, limit: i64, offset: i64) -> Result<Vec<SubmissionRecord>, DbError> {
+        let rows: Vec<SubmissionRow> =
+            sqlx::query_as("SELECT * FROM submissions ORDER BY created_at, submission_id LIMIT $1 OFFSET $2")
+                .bind(limit.max(0))
+                .bind(offset.max(0))
+                .fetch_all(&self.pool)
+                .await?;
+        self.attach_signatures(rows, true).await
     }
 
     /// Attach every row's three signature sets in ONE extra query, rather than
@@ -599,16 +695,44 @@ impl Db {
         // non-canonical attestation would brick the recovery path too.
         let sig = store::canonical_signature(&sig)?;
 
+        // M-2: same per-domain cap as `upsert_signature`, under the same row lock.
+        let signer_lc = sig.signer.to_ascii_lowercase();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT 1 FROM submissions WHERE submission_id = $1 FOR UPDATE")
+            .bind(&id)
+            .execute(&mut *tx)
+            .await?;
+        let count_sql = match kind {
+            SigKind::Cancel => {
+                "SELECT COUNT(*)::BIGINT FROM attestations WHERE submission_id = $1 AND kind = 'cancel'"
+            }
+            SigKind::Refund => {
+                "SELECT COUNT(*)::BIGINT FROM attestations WHERE submission_id = $1 AND kind = 'refund'"
+            }
+            SigKind::Transfer => unreachable!("rejected above"),
+        };
+        let present_sql = match kind {
+            SigKind::Cancel => {
+                "SELECT 1 FROM attestations WHERE submission_id = $1 AND signer = $2 AND kind = 'cancel'"
+            }
+            SigKind::Refund => {
+                "SELECT 1 FROM attestations WHERE submission_id = $1 AND signer = $2 AND kind = 'refund'"
+            }
+            SigKind::Transfer => unreachable!("rejected above"),
+        };
+        enforce_signature_cap(&mut tx, count_sql, present_sql, &id, &signer_lc, kind.as_str()).await?;
+
         sqlx::query(
             "INSERT INTO attestations (submission_id, kind, signer, signature) \
              VALUES ($1,$2,$3,$4) ON CONFLICT (submission_id, kind, signer) DO NOTHING",
         )
         .bind(&id)
         .bind(kind.as_str())
-        .bind(sig.signer.to_ascii_lowercase())
+        .bind(&signer_lc)
         .bind(&sig.signature)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         self.load(&id).await?.ok_or(DbError::BadField("submission_id"))
     }
@@ -619,6 +743,14 @@ impl Db {
 
     /// Mark a submission `claimed`, recording the target-chain claim tx hash.
     ///
+    /// **Authoritative — on-chain observation only.** The sole caller is the
+    /// indexer, on a `Gate.Claimed` event it read from the destination chain. The
+    /// keeper's own report goes through [`Db::note_keeper_claim`] instead and
+    /// touches none of the columns below (audit 2026-09-09, M-1: the Relay-scoped
+    /// HTTP route used to land here, so a leaked keeper token could hide any
+    /// transfer from both the claim and refund queues, and pre-poison future ids
+    /// via the park table).
+    ///
     /// Also clears an `eligible` refund flag: a transfer that sat past the
     /// timeout and then got claimed after all is not stuck, and leaving it
     /// flagged would show a permanent false "refund eligible" in the UI and keep
@@ -628,25 +760,57 @@ impl Db {
     /// chains disagree, and quietly overwriting it would hide that.
     pub async fn mark_claimed(&self, submission_id: &str, claim_tx: &str) -> Result<(), DbError> {
         let id = checked_id(submission_id)?;
-        let res = sqlx::query(
-            "UPDATE submissions SET status = 'claimed', claim_tx = $2, updated_at = now(), \
+        const SQL: &str = "UPDATE submissions SET status = 'claimed', claim_tx = $2, updated_at = now(), \
                     refund_status = CASE WHEN refund_status = 'eligible' THEN 'none' \
                                          ELSE refund_status END \
-             WHERE submission_id = $1",
-        )
-        .bind(&id)
-        .bind(claim_tx)
-        .execute(&self.pool)
-        .await?;
+             WHERE submission_id = $1";
+        let affected = self.lifecycle_update(SQL, &id, claim_tx).await?;
         // The indexer scans each chain in its own loop, so a destination
         // `Claimed` can arrive before the source `Sent` has created the row —
         // routinely during backfill. An UPDATE ... WHERE matches nothing and
         // reports success, which silently loses the claim: the transfer stays
         // `signed` and the refund sweep later flags a DELIVERED transfer as
         // eligible. Park it instead; `observe_submission` applies it on arrival.
-        self.park_if_missing(&id, res.rows_affected(), "claimed", Some(claim_tx), None, None, None)
-            .await?;
+        self.park_if_missing(
+            &id,
+            affected,
+            Retry { sql: SQL, arg: claim_tx },
+            Marker { status: "claimed", claim_tx: Some(claim_tx), ..Marker::NONE },
+        )
+        .await
+    }
+
+    /// The keeper's report that it submitted `claim()` for this transfer.
+    ///
+    /// **Advisory (M-1).** Writes `keeper_claim_tx` and nothing else: not
+    /// `status`, not `refund_status`, and no parked marker for an id we have no
+    /// row for. Every work queue (`pending_claims`, `sweep_refund_eligible`,
+    /// `refund_candidates`) keys on `status`, which only an observed on-chain
+    /// `Claimed` may set — so a Relay-scoped credential can annotate history but
+    /// cannot make a transfer disappear from it. First write wins, so a leaked
+    /// token cannot even overwrite an honest keeper's annotation.
+    ///
+    /// Unknown ids are a silent no-op rather than an error: the keeper may
+    /// legitimately claim before the indexer's `Sent` row exists, and a 4xx there
+    /// would only make it retry a write that carries no authority anyway.
+    pub async fn note_keeper_claim(&self, submission_id: &str, claim_tx: &str) -> Result<(), DbError> {
+        let id = checked_id(submission_id)?;
+        sqlx::query(
+            "UPDATE submissions SET keeper_claim_tx = COALESCE(keeper_claim_tx, $2) \
+             WHERE submission_id = $1",
+        )
+        .bind(&id)
+        .bind(claim_tx)
+        .execute(&self.pool)
+        .await?;
         Ok(())
+    }
+
+    /// Run one lifecycle `UPDATE ... WHERE submission_id = $1` with `$2 = arg`
+    /// and return how many rows it touched.
+    async fn lifecycle_update(&self, sql: &str, id: &str, arg: &str) -> Result<u64, DbError> {
+        let res = sqlx::query(sql).bind(id).bind(arg).execute(&self.pool).await?;
+        Ok(res.rows_affected())
     }
 
     /// Stash a lifecycle marker whose submission row does not exist yet.
@@ -658,48 +822,81 @@ impl Db {
     /// cancelled, putting a settled transfer back on the refund-candidate list.
     /// A guard that legitimately rejected the update must not be mistaken for a
     /// missing row.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// ## The race (audit 2026-09-09, LOW: `park_if_missing` TOCTOU)
+    ///
+    /// Between the UPDATE matching nothing and the existence check finding the
+    /// row, `observe_submission` can insert it and run `apply_pending_lifecycle`
+    /// against an empty park table. Returning "the guard declined it" there lost
+    /// the `Claimed`. So:
+    ///
+    /// 1. if the row exists now, RE-RUN the original UPDATE (`retry`) — its own
+    ///    guard decides again, correctly, against the row that now exists;
+    /// 2. if it does not, park the marker, then check ONCE MORE: a row inserted
+    ///    between the check and the park has already run its apply against a
+    ///    table that lacked our marker, so apply it ourselves. Any insert after
+    ///    our park commits sees the marker on its own apply. One of the two sides
+    ///    always observes the other, without an advisory lock on the hot path.
     async fn park_if_missing(
         &self,
         id: &str,
         rows_affected: u64,
-        status: &str,
-        claim_tx: Option<&str>,
-        cancel_tx: Option<&str>,
-        refund_tx: Option<&str>,
-        refund_status: Option<&str>,
+        retry: Retry<'_>,
+        marker: Marker<'_>,
     ) -> Result<(), DbError> {
         if rows_affected > 0 {
             return Ok(());
         }
+        if self.submission_exists(id).await? {
+            self.lifecycle_update(retry.sql, id, retry.arg).await?;
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO pending_lifecycle \
+               (submission_id, status, claim_tx, cancel_tx, refund_tx, refund_status) \
+             VALUES ($1,$2,$3,$4,$5,$6) \
+             ON CONFLICT (submission_id) DO UPDATE SET \
+               status        = COALESCE(EXCLUDED.status,        pending_lifecycle.status), \
+               claim_tx      = COALESCE(EXCLUDED.claim_tx,      pending_lifecycle.claim_tx), \
+               cancel_tx     = COALESCE(EXCLUDED.cancel_tx,     pending_lifecycle.cancel_tx), \
+               refund_tx     = COALESCE(EXCLUDED.refund_tx,     pending_lifecycle.refund_tx), \
+               refund_status = COALESCE(EXCLUDED.refund_status, pending_lifecycle.refund_status)",
+        )
+        .bind(id)
+        .bind(if marker.status.is_empty() { None } else { Some(marker.status) })
+        .bind(marker.claim_tx)
+        .bind(marker.cancel_tx)
+        .bind(marker.refund_tx)
+        .bind(marker.refund_status)
+        .execute(&self.pool)
+        .await?;
+        if self.submission_exists(id).await? {
+            self.apply_pending_lifecycle(id).await?;
+        }
+        Ok(())
+    }
+
+    async fn submission_exists(&self, id: &str) -> Result<bool, DbError> {
         let exists: Option<(i32,)> =
             sqlx::query_as("SELECT 1 FROM submissions WHERE submission_id = $1")
                 .bind(id)
                 .fetch_optional(&self.pool)
                 .await?;
-        if exists.is_some() {
-            // The row is there; the UPDATE's own guard declined it. Nothing to
-            // replay later.
-            return Ok(());
-        }
-        sqlx::query(
-            "INSERT INTO pending_lifecycle                (submission_id, status, claim_tx, cancel_tx, refund_tx, refund_status)              VALUES ($1,$2,$3,$4,$5,$6)              ON CONFLICT (submission_id) DO UPDATE SET                status        = COALESCE(EXCLUDED.status,        pending_lifecycle.status),                claim_tx      = COALESCE(EXCLUDED.claim_tx,      pending_lifecycle.claim_tx),                cancel_tx     = COALESCE(EXCLUDED.cancel_tx,     pending_lifecycle.cancel_tx),                refund_tx     = COALESCE(EXCLUDED.refund_tx,     pending_lifecycle.refund_tx),                refund_status = COALESCE(EXCLUDED.refund_status, pending_lifecycle.refund_status)",
-        )
-        .bind(id)
-        .bind(if status.is_empty() { None } else { Some(status) })
-        .bind(claim_tx)
-        .bind(cancel_tx)
-        .bind(refund_tx)
-        .bind(refund_status)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        Ok(exists.is_some())
     }
 
     /// Apply (and clear) any lifecycle marker parked before this row existed.
     async fn apply_pending_lifecycle(&self, id: &str) -> Result<(), DbError> {
         sqlx::query(
-            "UPDATE submissions s SET                status        = COALESCE(p.status,        s.status),                claim_tx      = COALESCE(p.claim_tx,      s.claim_tx),                cancel_tx     = COALESCE(p.cancel_tx,     s.cancel_tx),                refund_tx     = COALESCE(p.refund_tx,     s.refund_tx),                refund_status = COALESCE(p.refund_status, s.refund_status),                updated_at    = now()              FROM pending_lifecycle p              WHERE s.submission_id = $1 AND p.submission_id = s.submission_id",
+            "UPDATE submissions s SET \
+               status        = COALESCE(p.status,        s.status), \
+               claim_tx      = COALESCE(p.claim_tx,      s.claim_tx), \
+               cancel_tx     = COALESCE(p.cancel_tx,     s.cancel_tx), \
+               refund_tx     = COALESCE(p.refund_tx,     s.refund_tx), \
+               refund_status = COALESCE(p.refund_status, s.refund_status), \
+               updated_at    = now() \
+             FROM pending_lifecycle p \
+             WHERE s.submission_id = $1 AND p.submission_id = s.submission_id",
         )
         .bind(id)
         .execute(&self.pool)
@@ -716,44 +913,68 @@ impl Db {
     /// written from an observed on-chain event, never from a relayer's say-so.
     pub async fn mark_cancelled(&self, submission_id: &str, cancel_tx: &str) -> Result<(), DbError> {
         let id = checked_id(submission_id)?;
-        let res = sqlx::query(
-            "UPDATE submissions SET refund_status = 'cancelled', cancel_tx = $2, updated_at = now() \
-             WHERE submission_id = $1 AND refund_status <> 'refunded'",
+        const SQL: &str = "UPDATE submissions SET refund_status = 'cancelled', cancel_tx = $2, updated_at = now() \
+             WHERE submission_id = $1 AND refund_status <> 'refunded'";
+        let affected = self.lifecycle_update(SQL, &id, cancel_tx).await?;
+        self.park_if_missing(
+            &id,
+            affected,
+            Retry { sql: SQL, arg: cancel_tx },
+            Marker { cancel_tx: Some(cancel_tx), refund_status: Some("cancelled"), ..Marker::NONE },
         )
-        .bind(&id)
-        .bind(cancel_tx)
-        .execute(&self.pool)
-        .await?;
-        self.park_if_missing(&id, res.rows_affected(), "", None, Some(cancel_tx), None, Some("cancelled"))
-            .await?;
-        Ok(())
+        .await
     }
 
     /// Record that the source gate returned the funds (`Gate.Refunded`).
     pub async fn mark_refunded(&self, submission_id: &str, refund_tx: &str) -> Result<(), DbError> {
         let id = checked_id(submission_id)?;
-        let res = sqlx::query(
-            "UPDATE submissions SET refund_status = 'refunded', refund_tx = $2, updated_at = now() \
-             WHERE submission_id = $1",
+        const SQL: &str = "UPDATE submissions SET refund_status = 'refunded', refund_tx = $2, updated_at = now() \
+             WHERE submission_id = $1";
+        let affected = self.lifecycle_update(SQL, &id, refund_tx).await?;
+        self.park_if_missing(
+            &id,
+            affected,
+            Retry { sql: SQL, arg: refund_tx },
+            Marker { refund_tx: Some(refund_tx), refund_status: Some("refunded"), ..Marker::NONE },
         )
-        .bind(&id)
-        .bind(refund_tx)
-        .execute(&self.pool)
-        .await?;
-        self.park_if_missing(&id, res.rows_affected(), "", None, None, Some(refund_tx), Some("refunded"))
-            .await?;
-        Ok(())
+        .await
     }
 
     /// The transaction-history view: every submission with its status, claim tx,
     /// signature count, refund eligibility, swap intent (if any), and timestamps.
-    /// Newest first.
+    /// Newest first. Unbounded — see [`Db::history_page`] for the HTTP surface.
     pub async fn history(&self) -> Result<Vec<SubmissionHistory>, DbError> {
         let rows: Vec<SubmissionRow> =
             sqlx::query_as("SELECT * FROM submissions ORDER BY created_at DESC").fetch_all(&self.pool).await?;
-        let counts: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT submission_id, COUNT(*)::BIGINT FROM signatures GROUP BY submission_id",
+        self.history_for(rows).await
+    }
+
+    /// One page of the history view, newest first (ties broken by id so pages
+    /// are stable). The aggregate queries are scoped to the page's ids rather
+    /// than the whole table.
+    pub async fn history_page(&self, limit: i64, offset: i64) -> Result<Vec<SubmissionHistory>, DbError> {
+        let rows: Vec<SubmissionRow> = sqlx::query_as(
+            "SELECT * FROM submissions ORDER BY created_at DESC, submission_id LIMIT $1 OFFSET $2",
         )
+        .bind(limit.max(0))
+        .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+        self.history_for(rows).await
+    }
+
+    /// Attach signature counts, attestation counts and swap intent to `rows`,
+    /// with every aggregate scoped to exactly those rows.
+    async fn history_for(&self, rows: Vec<SubmissionRow>) -> Result<Vec<SubmissionHistory>, DbError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<String> = rows.iter().map(|r| r.submission_id.clone()).collect();
+        let counts: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT submission_id, COUNT(*)::BIGINT FROM signatures \
+             WHERE submission_id = ANY($1) GROUP BY submission_id",
+        )
+        .bind(&ids)
         .fetch_all(&self.pool)
         .await?;
         let counts: std::collections::HashMap<String, i64> = counts.into_iter().collect();
@@ -762,8 +983,9 @@ impl Db {
         // how far a stuck transfer has got through the refund path.
         let att_counts: Vec<(String, String, i64)> = sqlx::query_as(
             "SELECT submission_id, kind, COUNT(*)::BIGINT FROM attestations \
-             GROUP BY submission_id, kind",
+             WHERE submission_id = ANY($1) GROUP BY submission_id, kind",
         )
+        .bind(&ids)
         .fetch_all(&self.pool)
         .await?;
         let mut cancel_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
@@ -780,9 +1002,11 @@ impl Db {
             }
         }
 
-        let swap_bridges: Vec<SwapBridgeRow> = sqlx::query_as("SELECT * FROM swap_bridges")
-            .fetch_all(&self.pool)
-            .await?;
+        let swap_bridges: Vec<SwapBridgeRow> =
+            sqlx::query_as("SELECT * FROM swap_bridges WHERE submission_id = ANY($1)")
+                .bind(&ids)
+                .fetch_all(&self.pool)
+                .await?;
         let mut swap_bridges: std::collections::HashMap<String, SwapBridgeInfo> = swap_bridges
             .into_iter()
             .map(|r| (r.submission_id.clone(), r.into_info()))
@@ -908,12 +1132,54 @@ impl Db {
         .bind(final_receiver.to_ascii_lowercase())
         .execute(&self.pool)
         .await?;
+        // The destination leg may already have been observed — fold it in.
+        self.apply_pending_finalize(&id).await?;
         Ok(())
+    }
+
+    /// Apply (and clear) a destination outcome parked before the intent row
+    /// existed. Mirror of [`Db::apply_pending_lifecycle`] for `swap_bridges`.
+    async fn apply_pending_finalize(&self, id: &str) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE swap_bridges b SET \
+               finalize_tx         = p.finalize_tx, \
+               finalize_amount_out = p.finalize_amount_out, \
+               finalize_fallback   = p.finalize_fallback, \
+               finalized_at        = now() \
+             FROM pending_finalize p \
+             WHERE b.submission_id = $1 AND p.submission_id = b.submission_id \
+               AND b.finalize_tx IS NULL",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("DELETE FROM pending_finalize WHERE submission_id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn swap_bridge_exists(&self, id: &str) -> Result<bool, DbError> {
+        let exists: Option<(i32,)> =
+            sqlx::query_as("SELECT 1 FROM swap_bridges WHERE submission_id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(exists.is_some())
     }
 
     /// Record the destination-leg outcome (`Finalized` / `FinalizeFallback`) of a
     /// swap-bridge. `fallback = true` means the destination swap failed and the
     /// stable was delivered directly instead.
+    ///
+    /// The destination leg is scanned independently of the source leg, so this
+    /// can run before `record_swap_bridge_intent` has created the row (the same
+    /// race `pending_lifecycle` exists for). It used to be a silent no-op then —
+    /// the UI showed a finished swap-bridge as forever pending. Now it parks the
+    /// outcome in `pending_finalize`, applied when the intent arrives, with the
+    /// same double-check as [`Db::park_if_missing`] so an intent row inserted
+    /// concurrently cannot slip between the check and the park.
     pub async fn record_finalized(
         &self,
         submission_id: &str,
@@ -921,10 +1187,33 @@ impl Db {
         amount_out: &str,
         fallback: bool,
     ) -> Result<(), DbError> {
-        let id = norm_id(submission_id);
+        let id = checked_id(submission_id)?;
+        let update = || async {
+            let res = sqlx::query(
+                "UPDATE swap_bridges SET finalize_tx = $2, finalize_amount_out = $3, \
+                 finalize_fallback = $4, finalized_at = now() WHERE submission_id = $1",
+            )
+            .bind(&id)
+            .bind(finalize_tx)
+            .bind(amount_out)
+            .bind(fallback)
+            .execute(&self.pool)
+            .await?;
+            Ok::<u64, DbError>(res.rows_affected())
+        };
+        if update().await? > 0 {
+            return Ok(());
+        }
+        if self.swap_bridge_exists(&id).await? {
+            // Lost the race against `record_swap_bridge_intent`; the row is there now.
+            update().await?;
+            return Ok(());
+        }
         sqlx::query(
-            "UPDATE swap_bridges SET finalize_tx = $2, finalize_amount_out = $3, \
-             finalize_fallback = $4, finalized_at = now() WHERE submission_id = $1",
+            "INSERT INTO pending_finalize \
+               (submission_id, finalize_tx, finalize_amount_out, finalize_fallback) \
+             VALUES ($1,$2,$3,$4) \
+             ON CONFLICT (submission_id) DO NOTHING",
         )
         .bind(&id)
         .bind(finalize_tx)
@@ -932,6 +1221,9 @@ impl Db {
         .bind(fallback)
         .execute(&self.pool)
         .await?;
+        if self.swap_bridge_exists(&id).await? {
+            self.apply_pending_finalize(&id).await?;
+        }
         Ok(())
     }
 
@@ -998,9 +1290,10 @@ impl Db {
     /// A hint, not an authority. Every `try_*` still re-checks the chain before it
     /// submits, so a row wrongly included costs one wasted read and a row wrongly
     /// excluded is one the chain says is already settled. `status` only reaches
-    /// `'claimed'` from a claim this keeper made or one the indexer observed, so a
-    /// multi-keeper deployment running no indexer keeps re-probing rows another
-    /// keeper delivered — exactly today's behaviour, never worse.
+    /// `'claimed'` from a `Claimed` event the indexer observed (M-1: the keeper's
+    /// own report is advisory and does not move it), so a deployment running no
+    /// indexer keeps re-probing rows a keeper delivered — exactly the pre-indexer
+    /// behaviour, never worse.
     pub async fn pending_claims(&self, chain_id_to: u64) -> Result<Vec<SubmissionRecord>, DbError> {
         let rows: Vec<SubmissionRow> = sqlx::query_as(
             "SELECT * FROM submissions \

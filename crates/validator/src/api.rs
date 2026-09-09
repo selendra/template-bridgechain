@@ -12,17 +12,34 @@
 //!   GET  /status/{chain_id}
 //!   POST /pause/{chain_id}  /resume/{chain_id}  /rescan/{chain_id}
 //!
+//! ## Authentication (audit 2026-09-09)
+//!
+//! `/status` stays reachable WITHOUT a credential — the container healthcheck and
+//! monitoring read it — but an unauthenticated read gets a REDACTED view: liveness
+//! (`paused`, `pause_reason`, cursor) only. The validator address and the
+//! per-corridor nonce map, which together tell an attacker exactly which
+//! transfer a phishing or replay attempt should target, need the bearer token.
+//! With `allow_unauthenticated = true` (dev) everything is served in full.
+//!
+//! Every PRESENTED bearer, right or wrong, on any route draws from one small
+//! token bucket; when it is empty the API answers 429 without comparing. That
+//! bounds online guessing of the token at a few attempts per second. Requests
+//! with no `Authorization` header do not touch the bucket, so a healthcheck can
+//! never lock an operator out.
+//!
 //! Each source's state is shared with its scan loop via `Arc<Mutex<Runtime>>`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::middleware;
+use axum::extract::{Path, Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use bridge_core::auth::require_auth;
+use bridge_core::auth::ct_eq;
+use bridge_core::ratelimit::RateLimit;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -30,29 +47,111 @@ use tracing::{info, warn};
 
 use crate::state::Runtime;
 
+/// How many bearer attempts may arrive back to back before the API answers 429,
+/// and how fast that allowance refills. An operator's hand-driven curl and a
+/// dashboard polling `/status` with the token every few seconds fit inside it
+/// with room to spare; a brute-force loop does not.
+const AUTH_ATTEMPT_BURST: u32 = 30;
+const AUTH_ATTEMPTS_PER_SECOND: f64 = 2.0;
+
 #[derive(Clone)]
 pub struct ApiState {
     /// One runtime per watched source chain, keyed by chain_id.
     pub sources: Arc<BTreeMap<u64, Arc<Mutex<Runtime>>>>,
     pub validator: String,
     /// Shared secret required as `Authorization: Bearer <token>` on the state-
-    /// changing routes (pause/resume/rescan). `None` => no credential configured.
+    /// changing routes (pause/resume/rescan) and for the full `/status`.
+    /// `None` => no credential configured.
     pub token: Option<String>,
     /// Mount the control routes anyway when `token` is `None`. Dev only — see
     /// [`router`] for why the default is to leave them off entirely.
     pub allow_unauthenticated: bool,
 }
 
+/// The auth-related state the middleware and `/status` share.
+#[derive(Clone)]
+struct Guard {
+    token: Option<String>,
+    allow_unauthenticated: bool,
+    /// One bucket for every presented bearer (see the module note).
+    attempts: RateLimit,
+}
+
+impl Guard {
+    fn new(state: &ApiState) -> Guard {
+        Guard {
+            token: state.token.clone().filter(|t| !t.is_empty()),
+            allow_unauthenticated: state.allow_unauthenticated,
+            attempts: RateLimit::new(AUTH_ATTEMPT_BURST, AUTH_ATTEMPTS_PER_SECOND),
+        }
+    }
+
+    /// Classify one request's credential.
+    fn check(&self, req: &Request) -> Credential {
+        let Some(expected) = self.token.as_deref() else {
+            // No token configured: full access iff the operator opted into an
+            // open API; otherwise "unauthenticated" — the router has already left
+            // the control routes unmounted, and /status redacts.
+            return if self.allow_unauthenticated { Credential::Full } else { Credential::None };
+        };
+        let presented = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        let Some(presented) = presented else { return Credential::None };
+        // Draw BEFORE comparing, so an exhausted bucket refuses to evaluate the
+        // guess at all — a correct token during a flood gets 429 too, briefly,
+        // which is the price of the response not being an oracle.
+        if !self.attempts.check("") {
+            return Credential::Throttled;
+        }
+        if ct_eq(presented.as_bytes(), expected.as_bytes()) {
+            Credential::Full
+        } else {
+            Credential::Wrong
+        }
+    }
+}
+
+enum Credential {
+    /// Valid token, or an explicitly open (dev) API.
+    Full,
+    /// No `Authorization` header at all.
+    None,
+    /// A bearer was presented and does not match.
+    Wrong,
+    /// Too many bearers presented recently; not evaluated.
+    Throttled,
+}
+
+/// Middleware for the control routes: only a valid token passes.
+async fn require_token(State(g): State<Arc<Guard>>, req: Request, next: Next) -> Result<Response, StatusCode> {
+    match g.check(&req) {
+        Credential::Full => Ok(next.run(req).await),
+        Credential::None | Credential::Wrong => Err(StatusCode::UNAUTHORIZED),
+        Credential::Throttled => Err(StatusCode::TOO_MANY_REQUESTS),
+    }
+}
+
 #[derive(Serialize)]
 struct StatusResponse {
-    validator: String,
+    /// Redacted (omitted) on an unauthenticated read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validator: Option<String>,
     chain_id: u64,
     paused: bool,
     pause_reason: Option<String>,
     last_block: u64,
     next_block: u64,
     /// Last accepted nonce per corridor: `{ "<chain_from>": { "<chain_to>": n } }`.
-    nonces: BTreeMap<u64, BTreeMap<u64, u64>>,
+    /// Redacted (omitted) on an unauthenticated read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nonces: Option<BTreeMap<u64, BTreeMap<u64, u64>>>,
+    /// `true` when fields were withheld for lack of a bearer token, so a reader
+    /// can tell "no nonces yet" from "not shown to you".
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    redacted: bool,
 }
 
 #[derive(Deserialize)]
@@ -61,11 +160,15 @@ struct RescanRequest {
 }
 
 pub fn router(state: ApiState) -> Router {
-    // Read-only status stays open for monitoring; the state-changing routes
-    // (which can halt the validator — a DoS vector) require the bearer token.
+    let guard = Arc::new(Guard::new(&state));
+
+    // Read-only status stays reachable for monitoring (redacted without a token —
+    // see the module note); the state-changing routes (which can halt the
+    // validator — a DoS vector) require the bearer token.
     let status = Router::new()
         .route("/status", get(status_all))
-        .route("/status/:chain_id", get(status_one));
+        .route("/status/:chain_id", get(status_one))
+        .layer(axum::Extension(guard.clone()));
 
     let mut control = Router::new()
         .route("/pause", post(pause_bare))
@@ -75,11 +178,13 @@ pub fn router(state: ApiState) -> Router {
         .route("/rescan", post(rescan_bare))
         .route("/rescan/:chain_id", post(rescan_one));
 
-    match state.token.clone().filter(|t| !t.is_empty()) {
-        Some(token) => {
-            info!("operator API auth enabled: bearer token required for pause/resume/rescan");
-            control = control
-                .route_layer(middleware::from_fn_with_state(Arc::new(token), require_auth));
+    match guard.token.clone() {
+        Some(_) => {
+            info!(
+                "operator API auth enabled: bearer token required for pause/resume/rescan \
+                 and for the full /status (validator address + nonces)"
+            );
+            control = control.route_layer(middleware::from_fn_with_state(guard.clone(), require_token));
         }
         None if state.allow_unauthenticated => warn!(
             "allow_unauthenticated: operator API pause/resume/rescan are UNAUTHENTICATED \
@@ -93,7 +198,7 @@ pub fn router(state: ApiState) -> Router {
         None => {
             warn!(
                 "no operator API token configured — pause/resume/rescan are NOT mounted \
-                 (read-only /status still is). Set VALIDATOR_API_TOKEN, or \
+                 (a REDACTED read-only /status still is). Set VALIDATOR_API_TOKEN, or \
                  `allow_unauthenticated = true` in the [api] block for local dev."
             );
             return status.with_state(state);
@@ -140,39 +245,65 @@ fn runtime_of<'a>(
     })
 }
 
-async fn status_for(validator: &str, chain_id: u64, rt: &Arc<Mutex<Runtime>>) -> StatusResponse {
+async fn status_for(validator: &str, chain_id: u64, rt: &Arc<Mutex<Runtime>>, full: bool) -> StatusResponse {
     let rt = rt.lock().await;
     StatusResponse {
-        validator: validator.to_string(),
+        validator: full.then(|| validator.to_string()),
         chain_id,
         paused: rt.paused(),
         pause_reason: rt.pause_reason().map(|r| r.as_str()),
         last_block: rt.persist.last_block,
         next_block: rt.next_block(),
-        nonces: rt.persist.nonces.clone(),
+        nonces: full.then(|| rt.persist.nonces.clone()),
+        redacted: !full,
+    }
+}
+
+/// Decide how much of `/status` this request may see. A wrong or throttled bearer
+/// is an error rather than a silent downgrade, so a mistyped token is noticed.
+fn status_access(guard: &Guard, req: &Request) -> Result<bool, (StatusCode, Json<Value>)> {
+    match guard.check(req) {
+        Credential::Full => Ok(true),
+        Credential::None => Ok(false),
+        Credential::Wrong => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "ok": false, "error": "invalid bearer token (omit it for the redacted status)" })),
+        )),
+        Credential::Throttled => Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "ok": false, "error": "too many authentication attempts; retry shortly" })),
+        )),
     }
 }
 
 /// One source -> the legacy single object (keeps phase6.sh working). Several ->
 /// an array, one entry per chain.
-async fn status_all(State(s): State<ApiState>) -> Json<Value> {
+async fn status_all(
+    State(s): State<ApiState>,
+    axum::Extension(guard): axum::Extension<Arc<Guard>>,
+    req: Request,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let full = status_access(&guard, &req)?;
     if s.sources.len() == 1 {
         let (cid, rt) = s.sources.iter().next().unwrap();
-        return Json(json!(status_for(&s.validator, *cid, rt).await));
+        return Ok(Json(json!(status_for(&s.validator, *cid, rt, full).await)));
     }
     let mut out = Vec::with_capacity(s.sources.len());
     for (cid, rt) in s.sources.iter() {
-        out.push(status_for(&s.validator, *cid, rt).await);
+        out.push(status_for(&s.validator, *cid, rt, full).await);
     }
-    Json(json!(out))
+    Ok(Json(json!(out)))
 }
 
 async fn status_one(
     State(s): State<ApiState>,
+    axum::Extension(guard): axum::Extension<Arc<Guard>>,
     Path(chain_id): Path<u64>,
+    req: Request,
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<Value>)> {
+    let full = status_access(&guard, &req)?;
     let rt = runtime_of(&s, chain_id)?;
-    Ok(Json(status_for(&s.validator, chain_id, rt).await))
+    Ok(Json(status_for(&s.validator, chain_id, rt, full).await))
 }
 
 async fn pause_one(
@@ -306,14 +437,93 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    async fn get_status(app: Router, uri: &str, bearer: Option<&str>) -> (StatusCode, serde_json::Value) {
+        let mut b = Request::builder().method("GET").uri(uri);
+        if let Some(t) = bearer {
+            b = b.header(axum::http::header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let res = app.oneshot(b.body(Body::empty()).unwrap()).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let v = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, v)
+    }
+
     /// Monitoring must survive the lockdown: losing the halt button must not cost
-    /// an operator the ability to see whether this validator is stuck.
+    /// an operator the ability to see whether this validator is stuck. But the
+    /// unauthenticated view is REDACTED (audit 2026-09-09): liveness only.
     #[tokio::test]
-    async fn status_stays_readable_without_a_credential() {
+    async fn status_stays_readable_without_a_credential_but_redacted() {
         let p = temp_state_path("no-token-status");
-        let req = Request::builder().method("GET").uri("/status").body(Body::empty()).unwrap();
-        let res = app_with(&p, None, false).oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
+        let (code, v) = get_status(app_with(&p, None, false), "/status", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["paused"], false);
+        assert!(v.get("last_block").is_some());
+        assert!(v.get("validator").is_none(), "validator address must be withheld: {v}");
+        assert!(v.get("nonces").is_none(), "nonce map must be withheld: {v}");
+        assert_eq!(v["redacted"], true);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// With a token configured, the same read is full for the token holder,
+    /// redacted for nobody-in-particular, and an error for a WRONG bearer (so a
+    /// typo is noticed rather than silently downgraded).
+    #[tokio::test]
+    async fn status_is_full_only_with_the_token() {
+        let p = temp_state_path("status-token");
+        let app = app_with(&p, Some("s3cret"), false);
+
+        let (code, v) = get_status(app.clone(), "/status", Some("s3cret")).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["validator"], "0xtest");
+        assert!(v.get("nonces").is_some());
+        assert!(v.get("redacted").is_none());
+
+        let (code, v) = get_status(app.clone(), "/status", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(v.get("validator").is_none() && v.get("nonces").is_none(), "{v}");
+
+        let (code, _) = get_status(app.clone(), "/status", Some("wrong")).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+
+        let (code, v) = get_status(app.clone(), &format!("/status/{CHAIN}"), None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(v.get("validator").is_none(), "{v}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Dev mode keeps the old behaviour: everything in full, no token needed
+    /// (what phase6.sh greps for).
+    #[tokio::test]
+    async fn an_explicitly_open_api_serves_the_full_status() {
+        let p = temp_state_path("open-status");
+        let (code, v) = get_status(app_with(&p, None, true), "/status", None).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(v["validator"], "0xtest");
+        assert!(v.get("nonces").is_some());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Online guessing is bounded: after the burst of presented bearers the API
+    /// stops evaluating them (429) — for the right token too, briefly, so the
+    /// response is not an oracle. Requests with NO bearer are unaffected, so a
+    /// healthcheck can never lock the operator out.
+    #[tokio::test]
+    async fn bearer_attempts_are_rate_limited() {
+        let p = temp_state_path("auth-limit");
+        let app = app_with(&p, Some("s3cret"), false);
+        let mut saw_429 = false;
+        for _ in 0..(AUTH_ATTEMPT_BURST + 5) {
+            let code = post_with(app.clone(), "/pause", Some("guess")).await;
+            assert!(code == StatusCode::UNAUTHORIZED || code == StatusCode::TOO_MANY_REQUESTS, "{code}");
+            saw_429 |= code == StatusCode::TOO_MANY_REQUESTS;
+        }
+        assert!(saw_429, "a flood of wrong tokens must eventually be throttled");
+        // While throttled, the right token is not evaluated either...
+        assert_eq!(post_with(app.clone(), "/pause", Some("s3cret")).await, StatusCode::TOO_MANY_REQUESTS);
+        // ...but the credential-less healthcheck read is untouched.
+        let (code, _) = get_status(app.clone(), "/status", None).await;
+        assert_eq!(code, StatusCode::OK);
         let _ = std::fs::remove_file(&p);
     }
 

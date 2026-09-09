@@ -10,6 +10,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least privilege for the GITHUB_TOKEN every job receives: nothing here pushes,
+# comments or releases, so read-only is all it needs. A job that must do more
+# (none today) declares its own `permissions:` block. Actions below are pinned
+# to commit SHAs, not tags — a tag can be moved to different code after review;
+# a SHA cannot (audit round 4, LOW). The trailing comment names the version.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -22,15 +30,15 @@ jobs:
     name: Rust — fmt, clippy, tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, 2026-09
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # Also non-blocking until the tree is run through `cargo fmt --all` once;
       # flipping this on a large unformatted diff would bury real failures.
@@ -52,13 +60,13 @@ jobs:
     name: Solana gate — host tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, 2026-09
         with:
           components: clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: crates/solana-gate
 
@@ -79,9 +87,9 @@ jobs:
     name: Solana relayer — build + tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, 2026-09
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: crates/solana-relayer
 
@@ -98,11 +106,11 @@ jobs:
       run:
         working-directory: contracts
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
 
-      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
 
       - name: Build
         run: forge build --sizes
@@ -125,9 +133,9 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
 
       - name: Install
         run: bun install --frozen-lockfile
@@ -154,7 +162,7 @@ jobs:
 
       - name: Upload Playwright report
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: playwright-report
           path: frontend/playwright-report/
@@ -164,7 +172,7 @@ jobs:
     name: Compose + shell syntax
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Throwaway values for the `${VAR:?}` guards. Every secret in the compose
       # file is required-with-no-default ON PURPOSE, so that `docker compose up`
@@ -205,8 +213,8 @@ jobs:
     name: Dependency advisories
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -219,11 +227,14 @@ jobs:
     #     5-of-7 gate spends ~175k on recovery alone against a 200k default;
     #   * the 4 KB SBF stack frame limit;
     #   * the deployed .so artifact itself.
-    # Non-blocking while the Solana leg is unwired (finding M-3); make this
-    # REQUIRED before the program is ever deployed.
-    continue-on-error: true
+    # REQUIRED since audit round 4: the program is live on devnet and the
+    # relayer ships with it (SentRecord grew by 8 bytes; the two must deploy
+    # together), so a broken SBF build must block the merge, not annotate it.
+    # The toolchain is deterministic — docker/Dockerfile.solana pins
+    # SOLANA_VERSION and the lockfile is held at v3 by the check above — so a
+    # red here is a real regression, not toolchain drift.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Everything runs in Docker so the job needs no host Solana toolchain, and
       # it matches exactly what a developer runs locally.

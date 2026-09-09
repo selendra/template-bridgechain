@@ -80,6 +80,7 @@ contract UpgradeTest is Test {
     function test_ReplayAcrossDeployments_IsRejectedByTheDomain() public {
         vm.chainId(CHAIN_SRC);
         Gate srcGate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        srcGate.setSupportedChain(CHAIN_DST, true);
         TestToken token = new TestToken("Test", "TST");
         token.mint(user, 1_000 ether);
 
@@ -128,6 +129,7 @@ contract UpgradeTest is Test {
     function test_ReusingTheDomainOnRedeploy_IsStillReplayable() public {
         vm.chainId(CHAIN_SRC);
         Gate srcGate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        srcGate.setSupportedChain(CHAIN_DST, true);
         TestToken token = new TestToken("Test", "TST");
         token.mint(user, 1_000 ether);
 
@@ -198,6 +200,7 @@ contract UpgradeTest is Test {
     function test_Upgrade_SucceedsAfterTheDelay_AndKeepsAllState() public {
         vm.chainId(CHAIN_SRC);
         Gate gate = GateDeployer.deploy(validators, 1, DOMAIN_A);
+        gate.setSupportedChain(CHAIN_DST, true);
         TestToken token = new TestToken("Test", "TST");
         token.mint(user, 1_000 ether);
 

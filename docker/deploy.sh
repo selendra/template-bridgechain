@@ -22,6 +22,7 @@ V3=0x90F79bf6EB2c4f870365E785982E1f101E93b906
 SRC_RPC=http://127.0.0.1:8545
 DST_RPC=http://127.0.0.1:8546
 SRC_CHAIN=1337
+DST_CHAIN=1338
 AMOUNT=100000000000000000000
 
 EXPECT_TOKEN=0x5FbDB2315678afecb367f032d93F642f64180aa3
@@ -52,6 +53,9 @@ cast send "$EXPECT_TOKEN" "approve(address,uint256)" "$EXPECT_GATE" $AMOUNT --rp
 # target: fund gate liquidity + register the asset
 cast send "$EXPECT_TOKEN" "mint(address,uint256)" "$EXPECT_GATE" $AMOUNT --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 cast send "$EXPECT_GATE" "setLocalToken(bytes32,address)" "$DEBRIDGE_ID" "$EXPECT_TOKEN" --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
+# M-3: `send` refuses a destination the owner has not listed.
+cast send "$EXPECT_GATE" "setSupportedChain(uint256,bool)" $DST_CHAIN true --rpc-url $SRC_RPC --private-key $KEY0 >/dev/null
+cast send "$EXPECT_GATE" "setSupportedChain(uint256,bool)" $SRC_CHAIN true --rpc-url $DST_RPC --private-key $KEY0 >/dev/null
 
 echo "✅ deployed + wired. debridgeId=$DEBRIDGE_ID"
 echo "Now: docker compose up -d validator1 validator2 validator3 keeper"

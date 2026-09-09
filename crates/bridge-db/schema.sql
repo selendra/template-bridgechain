@@ -165,3 +165,25 @@ CREATE TABLE IF NOT EXISTS pending_lifecycle (
 -- superseded generation and MUST fail the id check rather than be recomputed
 -- under a zero domain, which is exactly the cross-deployment replay this closes.
 ALTER TABLE submissions ADD COLUMN IF NOT EXISTS bridge_domain TEXT;
+
+-- Audit 2026-09-09, M-1: the keeper's claim report is ADVISORY.
+--
+-- `POST /submissions/:id/claimed` (Relay scope) used to write `status='claimed'`
+-- directly, which every work queue filters on — so a leaked keeper token could
+-- hide any transfer from both the claim path and the refund path, and (since
+-- ids are deterministic) pre-poison future ones via the park table. The keeper
+-- now lands here instead; `status` is written ONLY from an observed on-chain
+-- `Claimed` (the indexer). Nothing reads this column for control flow.
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS keeper_claim_tx TEXT;
+
+-- Destination-leg swap outcomes (`Finalized` / `FinalizeFallback`) observed
+-- BEFORE the `swap_bridges` intent row exists — the same cross-chain scan race
+-- `pending_lifecycle` covers for the submission itself. Applied and deleted by
+-- `record_swap_bridge_intent` when the intent row arrives.
+CREATE TABLE IF NOT EXISTS pending_finalize (
+    submission_id       TEXT        PRIMARY KEY,
+    finalize_tx         TEXT        NOT NULL,
+    finalize_amount_out TEXT        NOT NULL,
+    finalize_fallback   BOOLEAN     NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);

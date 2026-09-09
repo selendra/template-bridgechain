@@ -14,11 +14,14 @@ import type {
   SwapHistoryEntry,
 } from "../api/types";
 import { SubmissionDetail } from "./SubmissionDetail";
-import { useChainDecimals } from "./useChainDecimals";
+import { useChainDecimals, type DecimalsProvider } from "./useChainDecimals";
 
 interface ExplorerProps {
   chains: Chain[];
   initialFilter?: SubmissionFilter;
+  /** Connected wallet, used to read token decimals on a chain the registry
+   *  publishes no `rpcUrl` for (H-4: the API never serves a keyed url). */
+  wallet?: DecimalsProvider | null;
 }
 
 const ANY = "any";
@@ -34,7 +37,7 @@ function ChainCell({ chains, id }: { chains: Chain[]; id: number }) {
   );
 }
 
-export function Explorer({ chains, initialFilter }: ExplorerProps) {
+export function Explorer({ chains, initialFilter, wallet }: ExplorerProps) {
   const [from, setFrom] = useState<string>(
     initialFilter?.chainIdFrom != null ? String(initialFilter.chainIdFrom) : ANY
   );
@@ -64,7 +67,7 @@ export function Explorer({ chains, initialFilter }: ExplorerProps) {
 
   const stats = usePoll<Stats>(() => fetchStats(), [], 5000);
   const subs = usePoll<Submission[]>(() => fetchSubmissions(filter), [from, to, readyOnly], 5000);
-  const decimalsByChain = useChainDecimals(chains);
+  const decimalsByChain = useChainDecimals(chains, wallet);
 
   // Best-effort: the DB-backed history/swap views only exist when graphql-api
   // was started with --store-url. Swallow failures into an empty list instead of
@@ -291,7 +294,7 @@ export function Explorer({ chains, initialFilter }: ExplorerProps) {
       )}
 
       {selected && (
-        <SubmissionDetail submissionId={selected} chains={chains} onClose={() => setSelected(null)} />
+        <SubmissionDetail submissionId={selected} chains={chains} wallet={wallet} onClose={() => setSelected(null)} />
       )}
     </section>
   );

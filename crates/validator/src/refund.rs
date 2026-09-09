@@ -202,8 +202,22 @@ enum Decision {
 /// The destination check (`executed == false`) never stopped it, because a
 /// transfer that is merely *in flight* has not been claimed yet either — that is
 /// precisely the window an early cancel steals.
+///
+/// ## A source this validator cannot read (audit round 4, M-4)
+///
+/// `src` is `None` when there is no reader for `chain_id_from` — today that means
+/// the source is Solana, which no EVM validator can read. The CANCEL leg is then
+/// impossible here, because the age can only be established on the source, and
+/// `aged_out` MUST be `false` for such a candidate (the caller guarantees it;
+/// this function refuses regardless). The REFUND leg is different: it follows a
+/// burn this validator observed on a destination it CAN read, at a confirmed
+/// block, and the source-side checks it skips (`sentBy`, `refunded`) only guard
+/// against a wasted attestation — the Solana program's `process_refund` refuses
+/// `NotSent` and a spent record on-chain. Skipping refunds too, as this loop
+/// used to (`return` on a missing source reader), left every stuck Solana→EVM
+/// transfer unrefundable.
 fn decide(
-    src: &SourceState,
+    src: Option<&SourceState>,
     dst: &DestinationState,
     aged_out: bool,
     already_attested_cancel: bool,
@@ -214,9 +228,17 @@ fn decide(
     if dst.executed && !dst.cancelled {
         return Decision::Skip("delivered on destination");
     }
-    // Source has already paid it back.
-    if src.refunded || src.sent_by == Address::ZERO {
-        return Decision::Skip("already refunded, or not sent from this gate");
+    match src {
+        // Source has already paid it back.
+        Some(src) if src.refunded || src.sent_by == Address::ZERO => {
+            return Decision::Skip("already refunded, or not sent from this gate");
+        }
+        Some(_) => {}
+        // No source reader: only the refund leg can proceed (see above).
+        None if !dst.cancelled => {
+            return Decision::Skip("source chain unreadable — cancel cannot be attested here");
+        }
+        None => {}
     }
     // A burn that is already on-chain is a settled fact — the refund leg does not
     // re-litigate the timeout, it only follows the destination.
@@ -324,37 +346,45 @@ async fn handle_candidate(
     sink: &StoreBackend,
     timeout_secs: i64,
 ) -> anyhow::Result<()> {
-    // Only vote on corridors we can verify BOTH ends of. Attesting on a chain we
-    // cannot read would mean trusting the store's word for whether a transfer was
-    // delivered — precisely the thing an attacker would want us to do.
-    let Some(src) = source_readers.get(&rec.chain_id_from) else { return Ok(()) };
+    // The DESTINATION must be readable: whether a transfer was delivered is the
+    // one fact no attestation may take from the store. A destination we cannot
+    // read is a corridor we do not vote on.
     let Some(dst) = dest_readers.get(&rec.chain_id_to) else { return Ok(()) };
+    // The SOURCE may be unreadable (round 4, M-4: a Solana source). Then only the
+    // refund leg is possible — `decide` enforces that — and the age is never
+    // claimed: `aged_out` stays false.
+    let src = source_readers.get(&rec.chain_id_from);
 
     let id = B256::from_str(&rec.submission_id).context("bad submission_id")?;
 
-    let src_state = src.source_state(id).await.context("reading source gate")?;
     let dst_state = dst.destination_state(id).await.context("reading destination gate")?;
+    let src_state = match src {
+        Some(s) => Some(s.source_state(id).await.context("reading source gate")?),
+        None => None,
+    };
 
     // H-2: establish the unclaimed timeout OURSELVES, from the source chain, and
     // never from the store's nomination. Only needed on the cancel leg — once the
     // destination is burned the refund follows an on-chain fact, not a timer — so
     // skip the reads when they cannot change the outcome.
-    let aged_out = if dst_state.cancelled {
-        true
-    } else {
-        match src.aged_block(timeout_secs).await.context("locating an aged source block")? {
-            Some(block) => src
-                .was_sent_by_block(id, block)
-                .await
-                .context("reading historical sentBy")?,
-            // The chain has no block old enough yet: nothing can have aged out.
-            None => false,
+    let aged_out = match (src, dst_state.cancelled) {
+        (_, true) => true,
+        (None, false) => false, // cannot be shown; `decide` skips the cancel anyway
+        (Some(src), false) => {
+            match src.aged_block(timeout_secs).await.context("locating an aged source block")? {
+                Some(block) => src
+                    .was_sent_by_block(id, block)
+                    .await
+                    .context("reading historical sentBy")?,
+                // The chain has no block old enough yet: nothing can have aged out.
+                None => false,
+            }
         }
     };
 
     let mine = |sigs: &[SignerSig]| sigs.iter().any(|s| s.signer.eq_ignore_ascii_case(&format!("{signer_addr:#x}")));
     let decision = decide(
-        &src_state,
+        src_state.as_ref(),
         &dst_state,
         aged_out,
         mine(&rec.cancel_signatures),
@@ -384,7 +414,7 @@ async fn handle_candidate(
         kind = kind.as_str(),
         chain_from = rec.chain_id_from,
         chain_to = rec.chain_id_to,
-        source_chain = src.chain_id,
+        source_readable = src.is_some(),
         dest_chain = dst.chain_id,
         "ATTESTED"
     );
@@ -411,13 +441,13 @@ mod tests {
         // THE safety rule. A claimed transfer must never earn a cancel or refund
         // attestation, whatever the store says about timeouts.
         let dst = DestinationState { executed: true, cancelled: false };
-        assert!(matches!(decide(&src(false), &dst, AGED, false, false), Decision::Skip(_)));
+        assert!(matches!(decide(Some(&src(false)), &dst, AGED, false, false), Decision::Skip(_)));
     }
 
     #[test]
     fn attests_cancel_when_destination_is_untouched_and_aged_out() {
         let dst = DestinationState { executed: false, cancelled: false };
-        assert_eq!(decide(&src(false), &dst, AGED, false, false), Decision::AttestCancel);
+        assert_eq!(decide(Some(&src(false)), &dst, AGED, false, false), Decision::AttestCancel);
     }
 
     /// THE H-2 rule. Appearing on the store's candidate list is not evidence of
@@ -428,13 +458,13 @@ mod tests {
     fn never_attests_a_cancel_before_the_timeout_it_verified_itself() {
         let untouched = DestinationState { executed: false, cancelled: false };
         assert_eq!(
-            decide(&src(false), &untouched, false, false, false),
+            decide(Some(&src(false)), &untouched, false, false, false),
             Decision::Skip("unclaimed timeout has not elapsed (verified on-chain)"),
             "a store nomination alone must not authorise a burn"
         );
         // The same candidate becomes attestable once it has genuinely aged.
         assert_eq!(
-            decide(&src(false), &untouched, AGED, false, false),
+            decide(Some(&src(false)), &untouched, AGED, false, false),
             Decision::AttestCancel
         );
     }
@@ -448,7 +478,7 @@ mod tests {
     fn a_compromised_store_cannot_shorten_the_window() {
         let in_flight = DestinationState { executed: false, cancelled: false };
         for already_cancel in [false, true] {
-            let d = decide(&src(false), &in_flight, false, already_cancel, false);
+            let d = decide(Some(&src(false)), &in_flight, false, already_cancel, false);
             assert!(
                 matches!(d, Decision::Skip(_)),
                 "a not-yet-aged transfer must never be cancelled, got {d:?}"
@@ -461,25 +491,25 @@ mod tests {
     #[test]
     fn a_burned_destination_still_earns_a_refund_without_an_age_check() {
         let burned = DestinationState { executed: true, cancelled: true };
-        assert_eq!(decide(&src(false), &burned, false, true, false), Decision::AttestRefund);
+        assert_eq!(decide(Some(&src(false)), &burned, false, true, false), Decision::AttestRefund);
     }
 
     #[test]
     fn attests_refund_only_after_the_burn_is_on_chain() {
         let untouched = DestinationState { executed: false, cancelled: false };
         assert_eq!(
-            decide(&src(false), &untouched, AGED, true, false),
+            decide(Some(&src(false)), &untouched, AGED, true, false),
             Decision::Skip("cancel already attested by us")
         );
 
         let burned = DestinationState { executed: true, cancelled: true };
-        assert_eq!(decide(&src(false), &burned, AGED, true, false), Decision::AttestRefund);
+        assert_eq!(decide(Some(&src(false)), &burned, AGED, true, false), Decision::AttestRefund);
     }
 
     #[test]
     fn stops_once_the_source_has_paid_out() {
         let burned = DestinationState { executed: true, cancelled: true };
-        assert!(matches!(decide(&src(true), &burned, AGED, true, true), Decision::Skip(_)));
+        assert!(matches!(decide(Some(&src(true)), &burned, AGED, true, true), Decision::Skip(_)));
     }
 
     #[test]
@@ -487,15 +517,55 @@ mod tests {
         // A quorum must not form for a transfer that was never locked here.
         let burned = DestinationState { executed: true, cancelled: true };
         let ghost = SourceState { sent_by: Address::ZERO, refunded: false };
-        assert!(matches!(decide(&ghost, &burned, AGED, false, false), Decision::Skip(_)));
+        assert!(matches!(decide(Some(&ghost), &burned, AGED, false, false), Decision::Skip(_)));
     }
 
     #[test]
     fn does_not_re_attest() {
         let burned = DestinationState { executed: true, cancelled: true };
         assert_eq!(
-            decide(&src(false), &burned, AGED, true, true),
+            decide(Some(&src(false)), &burned, AGED, true, true),
             Decision::Skip("refund already attested by us")
         );
+    }
+
+    // --- an unreadable source (round 4, M-4: Solana-origin transfers) --------
+
+    /// THE M-4 fix. This validator can read the EVM destination but not the
+    /// Solana source. It used to return before deciding anything, so a burned
+    /// Solana->EVM transfer never collected refund attestations from the EVM
+    /// validators and stayed stuck. A burn observed at a confirmed block is
+    /// enough for the refund leg; the source gate enforces the rest on-chain.
+    #[test]
+    fn a_burn_on_a_readable_destination_earns_a_refund_even_without_a_source_reader() {
+        let burned = DestinationState { executed: true, cancelled: true };
+        assert_eq!(decide(None, &burned, false, false, false), Decision::AttestRefund);
+        assert_eq!(
+            decide(None, &burned, false, false, true),
+            Decision::Skip("refund already attested by us")
+        );
+    }
+
+    /// The cancel leg needs the age, and the age lives on the source. No reader
+    /// => no cancel, however the candidate was nominated and even if the caller
+    /// somehow passed `aged_out = true`.
+    #[test]
+    fn no_source_reader_never_yields_a_cancel() {
+        let untouched = DestinationState { executed: false, cancelled: false };
+        for aged in [false, true] {
+            for already in [false, true] {
+                assert_eq!(
+                    decide(None, &untouched, aged, already, false),
+                    Decision::Skip("source chain unreadable — cancel cannot be attested here")
+                );
+            }
+        }
+    }
+
+    /// Delivered stays delivered, reader or not.
+    #[test]
+    fn a_delivered_transfer_is_never_attested_without_a_source_reader_either() {
+        let delivered = DestinationState { executed: true, cancelled: false };
+        assert!(matches!(decide(None, &delivered, true, false, false), Decision::Skip(_)));
     }
 }

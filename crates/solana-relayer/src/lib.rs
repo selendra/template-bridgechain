@@ -16,6 +16,7 @@
 //! keeping its own — the duplication that let `bridge_domain` break both.
 
 pub mod config;
+pub mod evm;
 pub mod gate;
 pub mod refund;
 pub mod source;

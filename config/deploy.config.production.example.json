@@ -19,7 +19,9 @@
     ],
     "threshold": 3,
     "guardian": "0x6666666666666666666666666666666666666666",
-    "owner": "0x7777777777777777777777777777777777777777"
+    "owner": "0x7777777777777777777777777777777777777777",
+    "seal": true,
+    "extra_supported_chains": []
   },
   "chains": [
     {
@@ -84,7 +86,8 @@
       "run": true,
       "guardian": "11111111111111111111111111111111",
       "max_validators": 8,
-      "max_corridors": 8
+      "max_corridors": 8,
+      "owner": "22222222222222222222222222222222"
     },
     "register_corridors": true,
     "assets": [

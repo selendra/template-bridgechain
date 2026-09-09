@@ -204,6 +204,39 @@ pub enum StoreError {
     SignerMismatch { claimed: String, recovered: String },
     #[error("token {token} does not hash to debridgeId {debridge_id} on chain {chain_id}")]
     TokenMismatch { token: String, debridge_id: String, chain_id: u64 },
+    /// Audit 2026-09-09, M-2: the per-submission signer cap for this domain
+    /// (`transfer` | `cancel` | `refund`) is full and the signer is new.
+    #[error(
+        "refusing signature: submission already holds {MAX_SIGNATURES_PER_SUBMISSION} {0} signers, \
+         which exceeds any real validator set"
+    )]
+    TooManySignatures(&'static str),
+}
+
+/// Audit 2026-09-09, M-2: how many DISTINCT signers one submission may hold per
+/// domain (`transfer`, `cancel`, `refund`), in the file store and in bridge-db.
+///
+/// A quorum is `threshold` out of a validator set that is a handful of
+/// addresses; 64 is an order of magnitude beyond any deployment, yet small
+/// enough that the keeper's per-tick `pending_claims` payload and its
+/// one-`isValidator`-call-per-unknown-signer memo stay bounded. Every signature
+/// still has to recover to its claimed signer, so the only thing the cap ever
+/// refuses is a leaked `Sign` credential minting throwaway keys to bloat a
+/// record. A signer already on the record is always accepted (idempotent
+/// re-POST), so an honest validator can never be locked out by junk.
+pub const MAX_SIGNATURES_PER_SUBMISSION: usize = 64;
+
+/// Merge `sig` into `bucket` deduped by signer, enforcing
+/// [`MAX_SIGNATURES_PER_SUBMISSION`]. `kind` names the domain in the error.
+fn push_capped(bucket: &mut Vec<SignerSig>, sig: SignerSig, kind: &'static str) -> Result<(), StoreError> {
+    if bucket.iter().any(|s| s.signer.eq_ignore_ascii_case(&sig.signer)) {
+        return Ok(());
+    }
+    if bucket.len() >= MAX_SIGNATURES_PER_SUBMISSION {
+        return Err(StoreError::TooManySignatures(kind));
+    }
+    bucket.push(sig);
+    Ok(())
 }
 
 /// True iff `s` is a well-formed submissionId: an optional `0x` followed by
@@ -476,13 +509,7 @@ pub fn upsert_signature(
         }
     }
 
-    let already = record
-        .signatures
-        .iter()
-        .any(|s| s.signer.eq_ignore_ascii_case(&sig.signer));
-    if !already {
-        record.signatures.push(sig);
-    }
+    push_capped(&mut record.signatures, sig, "transfer")?;
 
     std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
     Ok(record)
@@ -528,9 +555,7 @@ pub fn upsert_attestation(
         SigKind::Cancel => &mut record.cancel_signatures,
         SigKind::Refund => &mut record.refund_signatures,
     };
-    if !bucket.iter().any(|s| s.signer.eq_ignore_ascii_case(&sig.signer)) {
-        bucket.push(sig);
-    }
+    push_capped(bucket, sig, kind.as_str())?;
 
     std::fs::write(&path, serde_json::to_string_pretty(&record)?)?;
     Ok(record)
@@ -627,6 +652,44 @@ mod tests {
         d.push(format!("bridge-store-test-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
+    }
+
+    /// M-2: the file store refuses a 65th DISTINCT signer but still accepts a
+    /// re-POST from any signer already on the record.
+    #[test]
+    fn signer_count_per_submission_is_capped() {
+        let dir = tmp_dir("sig-cap");
+        let record = make_record();
+        let id = record.submission_id.clone();
+        let mut signers = Vec::new();
+        for _ in 0..MAX_SIGNATURES_PER_SUBMISSION {
+            let s = PrivateKeySigner::random();
+            upsert_signature(&dir, record.clone(), sign(&s, &id)).unwrap();
+            signers.push(s);
+        }
+        let stored = load(&dir, &id).unwrap().unwrap();
+        assert_eq!(stored.signatures.len(), MAX_SIGNATURES_PER_SUBMISSION);
+
+        // One more distinct signer is refused...
+        let extra = PrivateKeySigner::random();
+        let err = upsert_signature(&dir, record.clone(), sign(&extra, &id)).unwrap_err();
+        assert!(matches!(err, StoreError::TooManySignatures("transfer")), "{err}");
+        assert_eq!(load(&dir, &id).unwrap().unwrap().signatures.len(), MAX_SIGNATURES_PER_SUBMISSION);
+
+        // ...but an existing signer re-posting is still fine (idempotent).
+        upsert_signature(&dir, record.clone(), sign(&signers[3], &id)).unwrap();
+
+        // Attestation domains are capped independently of the transfer set.
+        for _ in 0..MAX_SIGNATURES_PER_SUBMISSION {
+            let s = PrivateKeySigner::random();
+            upsert_attestation(&dir, &id, SigKind::Cancel, sign_kind(&s, &id, SigKind::Cancel)).unwrap();
+        }
+        let err = upsert_attestation(&dir, &id, SigKind::Cancel, sign_kind(&extra, &id, SigKind::Cancel))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::TooManySignatures("cancel")), "{err}");
+        // A refund attestation is a different domain and is not blocked by it.
+        upsert_attestation(&dir, &id, SigKind::Refund, sign_kind(&extra, &id, SigKind::Refund)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -25,6 +25,11 @@ library GateDeployer {
     ///         belongs in every chain config, validator source and keeper target.
     ///         The implementation address is an internal detail that changes on
     ///         every upgrade and must never be configured anywhere.
+    /// @dev    The gate comes back UNSEALED with an empty destination registry:
+    ///         `send` refuses every chain until the owner lists it with
+    ///         {Gate.setSupportedChain}, and {Gate.setLocalToken} is instant until
+    ///         the owner calls {Gate.seal}. Wire chains and corridors, then seal,
+    ///         then fund — see {Gate.isSealed} for why that order matters.
     function deploy(address[] memory validators, uint256 threshold, bytes32 bridgeDomain)
         internal
         returns (Gate gate)

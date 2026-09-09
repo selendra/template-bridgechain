@@ -326,24 +326,25 @@ Other secrets in the system:
 
 | Secret | Where it comes from | Notes |
 | --- | --- | --- |
-| sig-store bearer token | `SIG_STORE_TOKEN` | Unset means the API is unauthenticated, and the process warns about it. Compose defaults to `dev-local-bridge-token`. |
+| sig-store bearer tokens | `SIG_STORE_{VALIDATOR,KEEPER,READER,ADMIN}_TOKEN` | One per role (scoped). The store **fails closed**: with none configured it refuses to bind unless started with `--allow-unauthenticated`, the explicit dev opt-out. Both launchers generate a random token per role per run into `RUN_DIR/tokens.env` (0600); the compose generator writes them to the stack's gitignored `.env`. |
+| Postgres password | `PG_PASSWORD` (run.config) / `database.docker.password` (bridge.config.json) | Random per run dir when unset, persisted in `RUN_DIR/tokens.env` and re-applied to the volume on every start; `DATABASE_URL` is derived from it. The container is bound to `127.0.0.1` only (M-10). |
 | validator operator API token | `[api] token` or `VALIDATOR_API_TOKEN` | Unset means `/pause`, `/resume`, and `/rescan` are unauthenticated. |
 | Postgres URL | `DATABASE_URL` or config | `sig-store` and `indexer` only. `graphql-api` deliberately has none — it is the internet-facing service, and a direct connection would sit outside the scope model in `bridge_core::auth`. |
 
 `docker/configs/*.toml` carry inline private keys.
-They are anvil's well-known development keys, so nothing there is at risk today, and `.dockerignore` excludes them from the Docker build context.
+They are anvil's well-known development keys, so nothing there is at risk today, and `.dockerignore` excludes them from the Docker build context — as it does every generated stack (`docker/*/configs`, `.env`, `keys`), `.solana/`, `config/deployments/`, the `*.local` configs and the root-level `*.toml` the test suites write, so `COPY . .` in the builder stage cannot bake a real key into an image layer.
 The pattern is still the one to break before a real key goes anywhere near it.
+
+**RPC urls are secrets too.** A hosted provider's url *is* its API key. Both launchers therefore keep the url the services dial (`rpc_url` / `rpcs[0]`) separate from the one the GraphQL API may hand to browsers (`public_rpc_url`, from `PUBLIC_RPCS[chain]` in `run.config` or `chains[].public_rpc` in `bridge.config.json`). The API serves only the public one — `null` when there is none, and the UI then reads through the wallet's provider — and `--production` refuses to start a registry with a chain missing it. The generated compose file references RPC urls as `${RPC_<chain>}` variables resolved from the stack's gitignored `.env`; `docker/*/docker-compose.yml` is gitignored since the H-4 leak, and the leaked key (`alch_0…`) must be treated as burned and rotated at the provider.
 
 ---
 
 ## 7. Deploy checklist
 
-There is no reviewed production deploy script in this repository.
-`contracts/script/DeploySwap.s.sol` and `DeployXSwap.s.sol` are local demos: threshold-1 gates and unrestricted-mint tokens, with no `block.chainid` guard to stop them running against a real network (L13 in `report.md`).
-`docker/deploy.sh` is closer to right but is anvil-specific.
+The production deploy path is `scripts/deploy-from-json.sh` with `"profile": "production"`, which runs `contracts/script/DeployProd.s.sol`: it asserts `EXPECTED_CHAIN_ID == block.chainid`, ≥ 3 validators with a strict-majority threshold, appoints the guardian, and starts the two-step ownership handover to the multisig — then the script lists every peer chain (`setSupportedChain`), registers every corridor (`setLocalToken`), calls `seal()`, and refuses to report success unless every gate is sealed and every peer listed. `DeploySwap.s.sol` / `DeployXSwap.s.sol` remain local demos (threshold-1 gates, unrestricted-mint tokens) and `docker/deploy.sh` is anvil-specific.
+The `local` profile refuses any chain id outside the dev/testnet allowlist in the script unless `--allow-local-profile-on-chain` is passed (M-12).
 
-Until a real script exists, this is the checklist it would need to encode.
-Every line is an assertion to make *after* deploying, not a step to trust.
+This is the checklist those scripts encode. Every line is an assertion to make *after* deploying, not a step to trust.
 
 **Gate, per chain**
 
@@ -354,12 +355,16 @@ Every line is an assertion to make *after* deploying, not a step to trust.
 3. `threshold` is the intended value and is greater than 1.
    A threshold of 1 means a single signature releases funds.
 4. **`guardian` is set and is not `address(0)`.**
-   `setGuardian` is called nowhere in this repository, so it is zero in every deployment this repo can currently produce (M8).
+   `DeployProd` calls `setGuardian` and reverts if it is zero or equal to the owner; the `local` profile leaves it optional, which is one reason that profile is refused on real chains.
    The guardian can pause but never unpause and never move funds, so it is safe to hold hot.
    Without it, the only key that can stop the bridge in an incident is the owner key, which is the one you most want to keep cold.
 5. `paused` is false.
-6. `localToken[debridgeId]` is set for every asset the gate must pay out, and the gate holds liquidity in each.
+6. `supportedChain[chainId]` is true for every chain this gate may `send` to, and false for everything else.
+   `send` reverts `UnsupportedChain` otherwise (M-3), so a missing peer is a dead corridor; a spurious one lets users lock funds towards a chain with no gate.
+7. `tokenOf[debridgeId]` is set for every asset the gate must pay out, and the gate holds liquidity in each.
    A transfer to an unregistered asset cannot be claimed.
+8. **`isSealed()` is true**, and it became true *before* the gate was funded.
+   Sealing ends the setup phase: from then on a new corridor needs `scheduleGovernance(setLocalTokenActionId(debridgeId, token))`, the 48 h `GOVERNANCE_DELAY`, and execution within the 7-day `SCHEDULE_GRACE`. That delay is what stops a stolen owner key from pointing a real corridor at a worthless token and draining the pot in one block (H-1). An unsealed gate holding funds is that drain waiting.
 
 **SwapPool, per chain, if deployed**
 
@@ -447,4 +452,25 @@ cast send $GATE "setValidator(address,bool)" $NEW_VALIDATOR true
 
 ### 9.2 Deploying the store
 
-`sig-store` refuses to bind with no bearer token configured, rather than serving an open store. Set at least one of `SIG_STORE_{VALIDATOR,KEEPER,READER,ADMIN}_TOKEN`; `--allow-unauthenticated` is the explicit dev opt-out. `graphql-api` takes `--production` to drop GraphiQL and introspection — and note the `chains` query returns each network's `rpc_url` verbatim, so never put a provider API key in the chains registry.
+`sig-store` refuses to bind with no bearer token configured, rather than serving an open store. Set at least one of `SIG_STORE_{VALIDATOR,KEEPER,READER,ADMIN}_TOKEN`; `--allow-unauthenticated` is the explicit dev opt-out. `graphql-api` takes `--production` to drop GraphiQL and introspection. The `chains` query serves each network's `public_rpc_url` (as `rpcUrl`, or `null`) and never its `rpc_url`; under `--production` a chain without a public url is a startup error. Every gate (EVM by `0x` address, Solana by base58 program id) and every swap pool (`swap_pool`) is registered from the chains file and read over that entry's `rpc_url`, so no url appears on the API's command line at all.
+
+### 9.3 Wiring a gate: supportedChain, corridors, seal
+
+Every gate, in this order, before it holds funds:
+
+```bash
+cast send $GATE "setSupportedChain(uint256,bool)" $PEER_CHAIN_ID true   # once per peer; instant, reversible
+cast send $GATE "setLocalToken(bytes32,address)" $DEBRIDGE_ID $LOCAL_TOKEN  # once per inbound corridor; write-once
+cast send $GATE "seal()"                                                  # last; irreversible
+```
+
+`scripts/run.sh` and `scripts/deploy-from-json.sh` do all three (`SEAL_GATES` / `gate.seal`, default `true`; `EXTRA_SUPPORTED_CHAINS` / `gate.extra_supported_chains` for peers outside the config, e.g. the Solana chain id) and assert the result. After `seal()`, adding a corridor is a governance action:
+
+```bash
+AID=$(cast call $GATE "setLocalTokenActionId(bytes32,address)(bytes32)" $DEBRIDGE_ID $LOCAL_TOKEN)
+cast send $GATE "scheduleGovernance(bytes32)" $AID
+# 48h later, within 7 days:
+cast send $GATE "setLocalToken(bytes32,address)" $DEBRIDGE_ID $LOCAL_TOKEN
+```
+
+The same shape on the Solana gate (`gate-admin`): `set-validator` (add) and `set-threshold` (lower) print the action id they need; `schedule-governance <action-id>`, wait 48 h, then the call itself; `governance-status` lists what is pending and `cancel-governance <action-id>` (owner or guardian) drops it. The Solana gate has **no ownership transfer** — whoever signs `init` owns it — so the production profile requires `solana.init.owner` to name the multisig-controlled key, to match `solana.payer_keypair`, and to come with `solana.init.guardian`. Deploy the program and the relayer together: `SentRecord` grew by 8 bytes (legacy records still decode).

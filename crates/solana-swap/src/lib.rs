@@ -55,7 +55,8 @@ use solana_program::{
 pub use swap_math as math;
 pub use swap_math::{
     amount_out, usd_value, PoolState as Pool, SwappedEvent, TokenState as TokenRec, BPS_DENOM,
-    POOL_SEED, POOL_SPACE, PRICE_ONE, TOKEN_SEED, TOKEN_SPACE, VAULT_AUTHORITY_SEED,
+    DEFAULT_MAX_PRICE_AGE, MAX_FEE_BPS, POOL_SEED, POOL_SPACE, PRICE_ONE, TOKEN_SEED, TOKEN_SPACE,
+    VAULT_AUTHORITY_SEED,
 };
 
 // ---------------------------------------------------------------------------
@@ -64,13 +65,19 @@ pub use swap_math::{
 
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug)]
 pub struct InitPoolArgs {
-    /// Swap fee in bps, charged on the USD value and retained as reserve.
+    /// Swap fee in bps, charged on the USD value and retained as reserve. At
+    /// most [`MAX_FEE_BPS`].
     pub fee_bps: u16,
-    /// Largest price move a single `SetPrice` may make, in bps.
+    /// Largest price move a single `SetPrice` may make, in bps (1..=10_000).
     pub max_price_deviation_bps: u16,
     /// Minimum seconds between two reprices of the SAME token. With the
     /// deviation cap this bounds the price to one capped step per interval; the
     /// cap alone would let a compromised oracle walk the price within one slot.
+    /// Must not be negative (a negative interval would let the oracle skip the
+    /// cooldown entirely).
+    ///
+    /// The staleness bound is not an argument: every pool starts at
+    /// [`DEFAULT_MAX_PRICE_AGE`] and the owner tunes it with `SetMaxPriceAge`.
     pub min_price_update_interval: i64,
     /// May pause but not unpause. `Pubkey::default()` for none.
     pub guardian: Pubkey,
@@ -99,7 +106,18 @@ pub enum SwapInstruction {
     Unpause,
     SetGuardian { guardian: Pubkey },
     SetOracle { oracle: Pubkey },
+    /// Owner only; at most [`MAX_FEE_BPS`].
     SetFee { fee_bps: u16 },
+    // New variants are appended, never inserted: the discriminant is the wire
+    // format, and `swap-admin` plus the browser encode the ones above by hand.
+    /// Owner only; `1..=10_000` bps, as `SwapPool.setMaxPriceDeviation`.
+    SetMaxPriceDeviation { bps: u16 },
+    /// Owner only; seconds a token's price may be old before swaps refuse it.
+    /// Must be positive — there is no "off" (see `PoolState::max_price_age`).
+    SetMaxPriceAge { seconds: i64 },
+    /// Owner only; the reprice cooldown, in seconds (zero disables it, as
+    /// `SwapPool.setMinPriceUpdateInterval` allows; negative is refused).
+    SetMinPriceUpdateInterval { seconds: i64 },
 }
 
 impl SwapInstruction {
@@ -150,6 +168,10 @@ pub enum SwapError {
     VaultNotExclusive,
     #[error("account does not match the one the pool registered")]
     AccountMismatch,
+    #[error("token's price is older than the pool's max_price_age")]
+    StalePrice,
+    #[error("fee exceeds the 10% cap")]
+    FeeTooHigh,
 }
 
 impl From<SwapError> for ProgramError {
@@ -185,6 +207,15 @@ pub fn process_instruction(
         SwapInstruction::SetGuardian { guardian } => process_set_role(program_id, accounts, Role::Guardian(guardian)),
         SwapInstruction::SetOracle { oracle } => process_set_role(program_id, accounts, Role::Oracle(oracle)),
         SwapInstruction::SetFee { fee_bps } => process_set_role(program_id, accounts, Role::Fee(fee_bps)),
+        SwapInstruction::SetMaxPriceDeviation { bps } => {
+            process_set_role(program_id, accounts, Role::MaxPriceDeviation(bps))
+        }
+        SwapInstruction::SetMaxPriceAge { seconds } => {
+            process_set_role(program_id, accounts, Role::MaxPriceAge(seconds))
+        }
+        SwapInstruction::SetMinPriceUpdateInterval { seconds } => {
+            process_set_role(program_id, accounts, Role::MinPriceUpdateInterval(seconds))
+        }
     }
 }
 
@@ -306,6 +337,15 @@ fn vault_balance(vault: &AccountInfo) -> Result<u64, ProgramError> {
         .amount)
 }
 
+/// Create a program-owned PDA, tolerating a pre-funded address.
+///
+/// NOT `system_instruction::create_account`: that fails with "already in use"
+/// when the address holds even one lamport, and every PDA here is derivable in
+/// advance (`["pool"]`, `["token", mint]`), so anyone could send a lamport to a
+/// mint's record address and make that mint unlistable — or brick `Init` —
+/// until the program was redeployed (audit M-5; the gate's H-2). Transfer the
+/// rent shortfall, then `allocate` + `assign`, which the system program permits
+/// on a funded-but-empty account. Same sequence as the gate's `create_marker`.
 fn create_pda<'a>(
     payer: &AccountInfo<'a>,
     account: &AccountInfo<'a>,
@@ -315,16 +355,33 @@ fn create_pda<'a>(
     bump: u8,
     space: usize,
 ) -> ProgramResult {
-    if !account.data_is_empty() {
+    // A pre-funded address has lamports but no data and is still owned by the
+    // system program; anything else is a genuine "already exists".
+    if !account.data_is_empty() || account.owner != &solana_program::system_program::id() {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
+    if system_program.key != &solana_program::system_program::id() {
+        return Err(ProgramError::IncorrectProgramId);
+    }
     let rent = Rent::get()?.minimum_balance(space);
+    let have = account.lamports();
+    if have < rent {
+        invoke(
+            &system_instruction::transfer(payer.key, account.key, rent - have),
+            &[payer.clone(), account.clone(), system_program.clone()],
+        )?;
+    }
     let mut signer_seeds: Vec<&[u8]> = seeds.to_vec();
     let bump_arr = [bump];
     signer_seeds.push(&bump_arr);
     invoke_signed(
-        &system_instruction::create_account(payer.key, account.key, rent, space as u64, program_id),
-        &[payer.clone(), account.clone(), system_program.clone()],
+        &system_instruction::allocate(account.key, space as u64),
+        &[account.clone(), system_program.clone()],
+        &[&signer_seeds],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(account.key, program_id),
+        &[account.clone(), system_program.clone()],
         &[&signer_seeds],
     )
 }
@@ -354,12 +411,7 @@ fn process_init(program_id: &Pubkey, accounts: &[AccountInfo], args: InitPoolArg
     if token_program.key != &spl_token::id() {
         return Err(ProgramError::IncorrectProgramId);
     }
-    if args.max_price_deviation_bps == 0 || args.max_price_deviation_bps > BPS_DENOM {
-        return Err(ProgramError::InvalidArgument);
-    }
-    if args.fee_bps >= BPS_DENOM {
-        return Err(ProgramError::InvalidArgument);
-    }
+    validate_init_args(&args)?;
 
     let (_, pool_bump) = Pubkey::find_program_address(&[POOL_SEED], program_id);
     let (expected_pool, _) = Pubkey::find_program_address(&[POOL_SEED], program_id);
@@ -377,8 +429,13 @@ fn process_init(program_id: &Pubkey, accounts: &[AccountInfo], args: InitPoolArg
         max_price_deviation_bps: args.max_price_deviation_bps,
         min_price_update_interval: args.min_price_update_interval,
         paused: false,
+        // A day, as the Solidity constructor sets. Deliberately not an Init
+        // argument: the dangerous configuration should be one an operator has
+        // to choose afterwards, on purpose, via SetMaxPriceAge.
+        max_price_age: DEFAULT_MAX_PRICE_AGE,
     };
     store(pool_ai, &pool)?;
+    let now = Clock::get()?.unix_timestamp;
 
     // The hub is listed here, at exactly 1.0, so the pool is never in a state
     // where its unit of account is missing.
@@ -406,6 +463,9 @@ fn process_init(program_id: &Pubkey, accounts: &[AccountInfo], args: InitPoolArg
             reserve: 0,
             last_price_update: 0,
             listed: true,
+            // The hub is exempt from the staleness check (its peg is fixed),
+            // but stamp it so the record reads like every other token's.
+            price_set_at: now,
         },
     )?;
     msg!("pool initialized; hub {} at 1.0", hub_mint.key);
@@ -431,7 +491,9 @@ fn process_list_token(program_id: &Pubkey, accounts: &[AccountInfo], price: u128
     if token_program.key != &spl_token::id() {
         return Err(ProgramError::IncorrectProgramId);
     }
-    if !rec_ai.data_is_empty() {
+    // Listed means "has our record", not "has lamports": a pre-funded address
+    // is still listable (see `create_pda`).
+    if !rec_ai.data_is_empty() || rec_ai.owner == program_id {
         return Err(SwapError::TokenAlreadyListed.into());
     }
     check_vault(program_id, vault, mint.key, token_program.key)?;
@@ -452,8 +514,12 @@ fn process_list_token(program_id: &Pubkey, accounts: &[AccountInfo], price: u128
             decimals,
             price,
             reserve: 0,
+            // Stays 0 so the FIRST reprice skips the cooldown (Solidity's
+            // `lastPriceUpdate`) …
             last_price_update: 0,
             listed: true,
+            // … while the staleness clock starts now (Solidity's `priceSetAt`).
+            price_set_at: Clock::get()?.unix_timestamp,
         },
     )?;
     msg!("listed {} at {}", mint.key, price);
@@ -485,23 +551,29 @@ fn process_set_price(program_id: &Pubkey, accounts: &[AccountInfo], price: u128)
     }
 
     let now = Clock::get()?.unix_timestamp;
-    // The first move after listing is always allowed; after that the pair of
-    // guards binds the price to one capped step per interval.
-    if rec.last_price_update != 0 {
-        if now < rec.last_price_update.saturating_add(pool.min_price_update_interval) {
-            return Err(SwapError::PriceUpdateTooSoon.into());
-        }
-        let old = rec.price;
-        let diff = if price > old { price - old } else { old - price };
-        let cap = math::mul_div_floor(old, pool.max_price_deviation_bps as u128, BPS_DENOM as u128)
-            .ok_or(SwapError::Overflow)?;
-        if diff > cap {
-            return Err(SwapError::PriceDeviationTooHigh.into());
-        }
+    // Time gate: only the FIRST reprice after listing is exempt, and only from
+    // the cooldown. After that the pair of guards binds the price to one capped
+    // step per interval.
+    if rec.last_price_update != 0
+        && now < rec.last_price_update.saturating_add(pool.min_price_update_interval)
+    {
+        return Err(SwapError::PriceUpdateTooSoon.into());
+    }
+    // Deviation cap: on EVERY update, the first included — exactly as
+    // `SwapPool.setPrice`. The listing price is the owner's, and exempting the
+    // oracle's first move from the cap let a compromised oracle key reprice a
+    // fresh token to ~0 and swap the reserve out in one step (audit M-6).
+    let old = rec.price;
+    let diff = if price > old { price - old } else { old - price };
+    let cap = math::mul_div_floor(old, pool.max_price_deviation_bps as u128, BPS_DENOM as u128)
+        .ok_or(SwapError::Overflow)?;
+    if diff > cap {
+        return Err(SwapError::PriceDeviationTooHigh.into());
     }
     msg!("price {} -> {}", rec.price, price);
     rec.price = price;
     rec.last_price_update = now;
+    rec.price_set_at = now;
     store(rec_ai, &rec)
 }
 
@@ -634,6 +706,15 @@ fn process_swap(
     if rec_in.vault != k(vault_in.key) || rec_out.vault != k(vault_out.key) {
         return Err(SwapError::AccountMismatch.into());
     }
+    // Refuse a price the oracle has stopped confirming — on BOTH sides, since
+    // either one being stale misprices the trade. Fail closed: a halted feed
+    // must stop the pool, not leave it paying out at yesterday's price. The
+    // rate limits on SetPrice do not cover this; they bound how fast a price
+    // may move, not how old it may be.
+    let now = Clock::get()?.unix_timestamp;
+    if !pool.price_is_fresh(&rec_in, now) || !pool.price_is_fresh(&rec_out, now) {
+        return Err(SwapError::StalePrice.into());
+    }
 
     // Pull first, price on what arrived.
     let before = vault_balance(vault_in)?;
@@ -745,6 +826,41 @@ enum Role {
     Guardian(Pubkey),
     Oracle(Pubkey),
     Fee(u16),
+    MaxPriceDeviation(u16),
+    MaxPriceAge(i64),
+    MinPriceUpdateInterval(i64),
+}
+
+/// The bounds `Init` puts on its arguments — the same ones the setters enforce
+/// afterwards, so a pool cannot be born in a state it could never be moved to.
+/// Public and pure because `Init` itself cannot run under `solana-program-test`
+/// (it reads the BPF loader's `ProgramData`), and these checks are what M-6
+/// asked for.
+pub fn validate_init_args(args: &InitPoolArgs) -> ProgramResult {
+    check_deviation_bps(args.max_price_deviation_bps)?;
+    check_fee_bps(args.fee_bps)?;
+    if args.min_price_update_interval < 0 {
+        return Err(ProgramError::InvalidArgument);
+    }
+    Ok(())
+}
+
+/// `SwapPool.setFee`'s bound: at most 10 %. The old `< 100 %` check let a fee
+/// alone round every payout to zero.
+fn check_fee_bps(bps: u16) -> ProgramResult {
+    if bps > MAX_FEE_BPS {
+        return Err(SwapError::FeeTooHigh.into());
+    }
+    Ok(())
+}
+
+/// `SwapPool.setMaxPriceDeviation`'s bound: `1..=10_000`. Zero would freeze
+/// every price forever; above 100 % is meaningless.
+fn check_deviation_bps(bps: u16) -> ProgramResult {
+    if bps == 0 || bps > BPS_DENOM {
+        return Err(ProgramError::InvalidArgument);
+    }
+    Ok(())
 }
 
 /// Accounts: [pool(w), owner(s)]
@@ -759,11 +875,81 @@ fn process_set_role(program_id: &Pubkey, accounts: &[AccountInfo], role: Role) -
         Role::Guardian(g) => pool.guardian = k(&g),
         Role::Oracle(o) => pool.oracle = k(&o),
         Role::Fee(f) => {
-            if f >= BPS_DENOM {
+            check_fee_bps(f)?;
+            pool.fee_bps = f;
+        }
+        Role::MaxPriceDeviation(bps) => {
+            check_deviation_bps(bps)?;
+            pool.max_price_deviation_bps = bps;
+        }
+        Role::MaxPriceAge(s) => {
+            // Strictly positive: 0 is the "unconfigured" encoding an old record
+            // decodes to, and there is deliberately no value that turns the
+            // guard off. Relax it by setting it large.
+            if s <= 0 {
                 return Err(ProgramError::InvalidArgument);
             }
-            pool.fee_bps = f;
+            pool.max_price_age = s;
+        }
+        Role::MinPriceUpdateInterval(s) => {
+            if s < 0 {
+                return Err(ProgramError::InvalidArgument);
+            }
+            pool.min_price_update_interval = s;
         }
     }
     store(pool_ai, &pool)
+}
+
+#[cfg(test)]
+mod init_arg_tests {
+    use super::*;
+
+    fn args(fee_bps: u16, dev: u16, interval: i64) -> InitPoolArgs {
+        InitPoolArgs {
+            fee_bps,
+            max_price_deviation_bps: dev,
+            min_price_update_interval: interval,
+            guardian: Pubkey::default(),
+            oracle: Pubkey::default(),
+        }
+    }
+
+    #[test]
+    fn init_accepts_the_solidity_defaults() {
+        assert_eq!(validate_init_args(&args(0, 1000, 3600)), Ok(()));
+        assert_eq!(validate_init_args(&args(MAX_FEE_BPS, BPS_DENOM, 0)), Ok(()), "bounds are inclusive");
+    }
+
+    #[test]
+    fn init_caps_the_fee_at_ten_percent() {
+        // The old check was `< 100%`, which let a fee alone round every payout
+        // to zero — `SwapPool.setFee` caps at 1000.
+        assert_eq!(validate_init_args(&args(MAX_FEE_BPS + 1, 1000, 3600)), Err(SwapError::FeeTooHigh.into()));
+        assert_eq!(validate_init_args(&args(9999, 1000, 3600)), Err(SwapError::FeeTooHigh.into()));
+    }
+
+    #[test]
+    fn init_bounds_the_deviation_cap() {
+        assert_eq!(validate_init_args(&args(0, 0, 3600)), Err(ProgramError::InvalidArgument));
+        assert_eq!(validate_init_args(&args(0, BPS_DENOM + 1, 3600)), Err(ProgramError::InvalidArgument));
+    }
+
+    #[test]
+    fn init_refuses_a_negative_cooldown() {
+        // `now < last + (-1)` is never true for a fresh update, so a negative
+        // interval would let the oracle skip the cooldown entirely.
+        assert_eq!(validate_init_args(&args(0, 1000, -1)), Err(ProgramError::InvalidArgument));
+    }
+
+    #[test]
+    fn new_instruction_variants_are_appended_after_the_existing_discriminants() {
+        // The discriminant IS the wire format the admin tool and the browser
+        // hand-encode; a reorder would silently repoint every one of them.
+        assert_eq!(SwapInstruction::Init(args(0, 1000, 0)).to_bytes()[0], 0);
+        assert_eq!(SwapInstruction::SetFee { fee_bps: 0 }.to_bytes()[0], 10);
+        assert_eq!(SwapInstruction::SetMaxPriceDeviation { bps: 0 }.to_bytes(), vec![11, 0, 0]);
+        assert_eq!(SwapInstruction::SetMaxPriceAge { seconds: 1 }.to_bytes(), [vec![12], 1i64.to_le_bytes().to_vec()].concat());
+        assert_eq!(SwapInstruction::SetMinPriceUpdateInterval { seconds: 1 }.to_bytes()[0], 13);
+    }
 }

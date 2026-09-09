@@ -34,6 +34,15 @@
 #   GATE_B=$(deploy_gate "$RPC_B" "$KEY0" "[$V1,$V2]" 2)   # $BRIDGE_DOMAIN
 #
 # Pass a 5th argument only to deploy a gate deliberately OUTSIDE this mesh.
+#
+# Destinations (M-3, audit round 4): `send` reverts UnsupportedChain unless the
+# owner has listed the destination chain. The suites here bridge between the
+# local anvil ids 1337/1338/1339 (plus 9999, which db-e2e.sh uses to prove the
+# validator allowlist blocks a chain the GATE accepts, and the Solana test id),
+# so every gate lists all of them — override with GATE_PEER_CHAINS="a b c".
+# Gates are left UNSEALED: every suite registers its corridors after deploy, and
+# they are throwaway. `seal_gate rpc key gate` is there for the ones that want
+# to exercise the sealed path.
 
 _GATE_CONTRACTS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../contracts" && pwd)"
 
@@ -67,5 +76,16 @@ deploy_gate() {  # rpc key validators threshold [domain] -> echoes the PROXY add
   proxy=$(_forge_create "$rpc" "$key" src/GateProxy.sol:GateProxy --constructor-args "$impl" "$initdata")
   [[ "$proxy" =~ ^0x[0-9a-fA-F]{40}$ ]] || { echo "deploy_gate: proxy deploy failed on $rpc" >&2; return 1; }
 
+  local peer
+  for peer in ${GATE_PEER_CHAINS:-1337 1338 1339 31337 9999 7565164}; do
+    cast send "$proxy" "setSupportedChain(uint256,bool)" "$peer" true \
+      --rpc-url "$rpc" --private-key "$key" >/dev/null 2>&1 \
+      || { echo "deploy_gate: setSupportedChain($peer) failed on $rpc" >&2; return 1; }
+  done
+
   printf '%s' "$proxy"
+}
+
+seal_gate() {  # rpc key gate — irreversible; setLocalToken then needs scheduleGovernance + 48h
+  cast send "$3" "seal()" --rpc-url "$1" --private-key "$2" >/dev/null
 }

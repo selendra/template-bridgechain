@@ -19,3 +19,24 @@ docker/configs/*.toml
 docs
 report.md
 .git
+# Generated stacks, deploy records and local configs: real RPC keys, validator
+# and keeper private keys, Solana keypairs. `COPY . .` in the builder stage
+# would bake any of them into an image layer (audit round 4, LOW).
+docker/*/configs
+docker/*/.env
+docker/*/keys
+docker/production/*/.env
+docker/production/*/configs
+docker/production/*/secrets
+.solana
+scripts/*.config.local
+scripts/run.config.local
+config/*.local.json
+config/deployments
+sig-store-data*
+# root-level TOMLs are the ad-hoc service configs the test suites write (they
+# carry private_key); `*` does not cross `/`, so crate manifests are untouched.
+*.toml
+!Cargo.toml
+frontend/.env.local
+.env

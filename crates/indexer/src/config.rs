@@ -101,7 +101,29 @@ impl Config {
         // stranded transfer (reorged-away `Claimed`) or assert a burn that no
         // longer exists (reorged-away `Cancelled`). Fail closed, exactly as the
         // validator does, unless the operator opts in for an instant-final chain.
+        // Degenerate values that TOML accepts and the loops do not. Each of
+        // these used to be taken at face value: a zero range makes the scan
+        // window empty (or underflows) so the cursor never advances; a zero
+        // sweep interval is a busy loop hammering Postgres; a non-positive
+        // refund timeout flags EVERY unclaimed transfer refund-eligible the
+        // instant it is indexed, nominating live transfers for cancellation.
+        anyhow::ensure!(
+            cfg.refund_timeout_secs > 0,
+            "refund_timeout_secs must be > 0 (got {}) — a non-positive timeout would flag every \
+             unclaimed transfer refund-eligible immediately",
+            cfg.refund_timeout_secs
+        );
+        anyhow::ensure!(
+            cfg.sweep_interval_secs > 0,
+            "sweep_interval_secs must be > 0 — zero is a busy loop against the database"
+        );
         for c in &cfg.chains {
+            anyhow::ensure!(
+                c.max_block_range > 0,
+                "chain_id {} has max_block_range = 0 — the scan window would be empty and the \
+                 cursor would never advance",
+                c.chain_id
+            );
             if c.block_confirmation == 0 && !c.allow_zero_confirmation {
                 anyhow::bail!(
                     "chain_id {} has block_confirmation = 0 — the indexer would record \
@@ -162,6 +184,39 @@ mod tests {
     fn nonzero_confirmation_is_accepted() {
         let c = Config::from_toml(&cfg("block_confirmation = 12")).expect("should load");
         assert_eq!(c.chains[0].block_confirmation, 12);
+    }
+
+    #[test]
+    fn zero_max_block_range_is_rejected() {
+        let err = Config::from_toml(&cfg("block_confirmation = 12\nmax_block_range = 0"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max_block_range = 0"), "got: {err}");
+    }
+
+    #[test]
+    fn zero_sweep_interval_is_rejected() {
+        let raw = format!("sweep_interval_secs = 0\n{}", cfg("block_confirmation = 12"));
+        let err = Config::from_toml(&raw).unwrap_err().to_string();
+        assert!(err.contains("sweep_interval_secs"), "got: {err}");
+    }
+
+    #[test]
+    fn non_positive_refund_timeout_is_rejected() {
+        for v in ["0", "-1", "-86400"] {
+            let raw = format!("refund_timeout_secs = {v}\n{}", cfg("block_confirmation = 12"));
+            let err = Config::from_toml(&raw).unwrap_err().to_string();
+            assert!(err.contains("refund_timeout_secs must be > 0"), "{v}: got: {err}");
+        }
+        let raw = format!("refund_timeout_secs = 1\n{}", cfg("block_confirmation = 12"));
+        assert!(Config::from_toml(&raw).is_ok());
+    }
+
+    /// The defaults themselves must satisfy the new checks.
+    #[test]
+    fn defaults_are_valid() {
+        let c = Config::from_toml(&cfg("block_confirmation = 12")).expect("defaults load");
+        assert!(c.refund_timeout_secs > 0 && c.sweep_interval_secs > 0 && c.chains[0].max_block_range > 0);
     }
 
     // M-4: a typo must be an error, not a silent default.

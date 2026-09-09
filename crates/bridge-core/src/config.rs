@@ -30,9 +30,58 @@ where
     Ok(())
 }
 
+/// A URL safe to put in a log line: scheme and host (and port) only.
+///
+/// Hosted RPC providers put the API key in the PATH (`/v2/<key>`) or the query
+/// (`?apikey=`), and a keyed endpoint logged at startup is a credential in every
+/// log shipper, crash dump and support ticket downstream (audit 2026-09-09, H-4
+/// / LOW "keyed RPC URLs logged"). Userinfo (`user:pass@`) is dropped too. If
+/// the string does not parse as `scheme://host…` at all, the whole thing is
+/// replaced rather than guessed at — a value we cannot classify is treated as
+/// secret.
+pub fn redact_url(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "<redacted>".to_string();
+    };
+    // Authority ends at the first of `/`, `?`, `#`.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Drop `user:pass@`.
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    if scheme.is_empty() || host.is_empty() {
+        return "<redacted>".to_string();
+    }
+    format!("{scheme}://{host}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_url_keeps_scheme_host_port_only() {
+        assert_eq!(
+            redact_url("https://eth-sepolia.g.alchemy.com/v2/SuPerSecretKey123"),
+            "https://eth-sepolia.g.alchemy.com"
+        );
+        assert_eq!(redact_url("http://127.0.0.1:8545"), "http://127.0.0.1:8545");
+        assert_eq!(redact_url("http://127.0.0.1:8545/"), "http://127.0.0.1:8545");
+        assert_eq!(redact_url("wss://node.example:8546/ws?apikey=abc"), "wss://node.example:8546");
+        assert_eq!(redact_url("https://host/path#frag"), "https://host");
+    }
+
+    #[test]
+    fn redact_url_drops_userinfo_and_query() {
+        assert_eq!(redact_url("https://user:pw@rpc.example.com/x?key=1"), "https://rpc.example.com");
+        assert_eq!(redact_url("https://rpc.example.com?apikey=zzz"), "https://rpc.example.com");
+    }
+
+    #[test]
+    fn redact_url_never_echoes_something_it_cannot_classify() {
+        for s in ["", "not a url", "://", "https://", "key-only-string"] {
+            let out = redact_url(s);
+            assert_eq!(out, "<redacted>", "input {s:?} gave {out:?}");
+        }
+    }
 
     #[test]
     fn accepts_distinct_keys() {

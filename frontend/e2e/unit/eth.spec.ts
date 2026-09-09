@@ -161,6 +161,43 @@ test.describe("encodeSend", () => {
     expect(() => encodeSend(A, 1n, 1338n, "0xabc", "0x")).toThrow(/bad bytes/);
     expect(() => encodeSend(A, 1n, 1338n, "0xzz", "0x")).toThrow(/bad bytes/);
   });
+
+  // EVM -> Solana: the receiver the user types is a base58 account key, and the
+  // Gate wants its 32 raw bytes. This used to go straight into the hex encoder
+  // and fail closed with "bad bytes" (audit round 4, LOW).
+  test("a base58 Solana receiver is decoded to its 32 bytes", () => {
+    // base58 of 0x11 * 32 (same bytes as the hex test above)
+    const { words } = decode(encodeSend(A, 1n, 7565164n, "29d2S7vB453rNYFdR5Ycwt7y9haRT5fwVwL9zTmBhfV2", "0x"));
+    const offReceiver = Number(BigInt("0x" + words[3]));
+    expect(words[offReceiver / 32]).toBe(word(32n));
+    expect(words[offReceiver / 32 + 1]).toBe("11".repeat(32));
+    // byte-exact against a second vector: 0x01..0x20
+    const { words: w2 } = decode(encodeSend(A, 1n, 7565164n, "4wBqpZM9xaSheZzJSMawUKKwhdpChKbZ5eu5ky4Vigw", "0x"));
+    const expected = Array.from({ length: 32 }, (_, i) => (i + 1).toString(16).padStart(2, "0")).join("");
+    expect(w2[Number(BigInt("0x" + w2[3])) / 32 + 1]).toBe(expected);
+    // the system program id: 32 zero bytes, all leading-zero handling
+    const { words: w3 } = decode(encodeSend(A, 1n, 7565164n, "11111111111111111111111111111111", "0x"));
+    expect(w3[Number(BigInt("0x" + w3[3])) / 32 + 1]).toBe("00".repeat(32));
+  });
+
+  test("a base58 key that is not exactly 32 bytes is refused", () => {
+    // 31 bytes of 0x11 — well-formed base58, wrong width
+    expect(() => encodeSend(A, 1n, 7565164n, "G6ShajrrdiRnD4mW22j8T5kXyKSvwXaC64S9VGSzFA", "0x")).toThrow(/32/);
+    expect(() => encodeSend(A, 1n, 7565164n, "not-base58-0OIl", "0x")).toThrow(/bad receiver/);
+  });
+
+  // H-3: ClaimArgs.amount / CancelArgs.amount on the Solana gate are u64. The
+  // Gate reverts AmountTooWide for a 32-byte receiver above 2^64-1; anything
+  // that got past it would be locked forever, so the UI refuses it too.
+  test("a 32-byte receiver caps the amount at 2^64-1", () => {
+    const max = (1n << 64n) - 1n;
+    const b58 = "29d2S7vB453rNYFdR5Ycwt7y9haRT5fwVwL9zTmBhfV2";
+    expect(() => encodeSend(A, max, 7565164n, b58, "0x")).not.toThrow();
+    expect(() => encodeSend(A, max + 1n, 7565164n, b58, "0x")).toThrow(/AmountTooWide/);
+    expect(() => encodeSend(A, max + 1n, 7565164n, "0x" + "11".repeat(32), "0x")).toThrow(/AmountTooWide/);
+    // a 20-byte EVM receiver is uncapped
+    expect(() => encodeSend(A, max + 1n, 1338n, "0x" + "ee".repeat(20), "0x")).not.toThrow();
+  });
 });
 
 test.describe("encodeAutoParamsTo", () => {

@@ -273,10 +273,34 @@ pub struct SentRecord {
     pub source_token: [u8; 32],
     pub mint: [u8; 32],
     pub amount: u64,
+    /// Cluster unix time the funds were locked (round 4, M-4/M-13). The refund
+    /// attester reads this — never the store's nomination — to establish that a
+    /// Solana-source transfer has been unclaimed for the timeout.
+    pub locked_at: i64,
 }
 
-/// Borsh size of a [`SentRecord`]: four pubkey-width fields plus a u64.
-pub const SENT_RECORD_LEN: usize = 32 + 32 + 32 + 32 + 8;
+/// Borsh size of a [`SentRecord`]: four pubkey-width fields plus two 8-byte words.
+pub const SENT_RECORD_LEN: usize = 32 + 32 + 32 + 32 + 8 + 8;
+/// The pre-round-4 size (no `locked_at`). Still accepted — see [`decode_sent_record`].
+pub const LEGACY_SENT_RECORD_LEN: usize = SENT_RECORD_LEN - 8;
+
+/// Decode a `["sent", id]` record body, accepting the legacy layout with an
+/// unknown (zero) `locked_at`. `None` for any other length or a malformed body.
+///
+/// The program applies the same rule, so an in-flight transfer locked before the
+/// upgrade stays refundable; its age simply cannot be shown, and every age check
+/// treats `locked_at == 0` as "not aged".
+pub fn decode_sent_record(data: &[u8]) -> Option<SentRecord> {
+    match data.len() {
+        SENT_RECORD_LEN => SentRecord::try_from_slice(data).ok(),
+        LEGACY_SENT_RECORD_LEN => {
+            let mut padded = data.to_vec();
+            padded.extend_from_slice(&[0u8; 8]);
+            SentRecord::try_from_slice(&padded).ok()
+        }
+        _ => None,
+    }
+}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SentRecordError {
@@ -284,7 +308,7 @@ pub enum SentRecordError {
     Missing,
     #[error("[\"sent\", id] account is not owned by the gate program")]
     NotProgramOwned,
-    #[error("[\"sent\", id] record is {0} bytes, expected {SENT_RECORD_LEN}")]
+    #[error("[\"sent\", id] record is {0} bytes, expected {SENT_RECORD_LEN} (or the legacy {LEGACY_SENT_RECORD_LEN})")]
     BadLength(usize),
     #[error("[\"sent\", id] record does not decode as a SentRecord")]
     Malformed,
@@ -316,11 +340,10 @@ pub fn verify_sent_record(
     if data.is_empty() {
         return Err(SentRecordError::Missing);
     }
-    if data.len() != SENT_RECORD_LEN {
+    if data.len() != SENT_RECORD_LEN && data.len() != LEGACY_SENT_RECORD_LEN {
         return Err(SentRecordError::BadLength(data.len()));
     }
-    let record =
-        SentRecord::try_from_slice(data).map_err(|_| SentRecordError::Malformed)?;
+    let record = decode_sent_record(data).ok_or(SentRecordError::Malformed)?;
 
     // `process_refund` zeroes the record on payout. An all-zero record proves the
     // transfer was already repaid on the source, so it must not corroborate a
@@ -343,7 +366,7 @@ pub fn verify_sent_record(
 }
 
 /// Convert the hash-form auto-params into the Borsh instruction/event form.
-fn auto_to_wire(a: &AutoParams) -> AutoParamsWire {
+pub fn auto_to_wire(a: &AutoParams) -> AutoParamsWire {
     let mut fee = [0u8; 16];
     fee.copy_from_slice(&a.execution_fee[16..]);
     let mut flags = [0u8; 8];
@@ -358,7 +381,7 @@ fn auto_to_wire(a: &AutoParams) -> AutoParamsWire {
 
 /// Inverse of [`auto_to_wire`]: widen the Borsh scalars back to the 32-byte hash
 /// words and attach `native_sender` (the field the submissionId hashes over).
-fn wire_to_auto(w: &AutoParamsWire, native_sender: &[u8]) -> AutoParams {
+pub fn wire_to_auto(w: &AutoParamsWire, native_sender: &[u8]) -> AutoParams {
     let mut execution_fee = [0u8; 32];
     execution_fee[16..].copy_from_slice(&w.execution_fee.to_be_bytes());
     let mut flags = [0u8; 32];
@@ -370,6 +393,97 @@ fn wire_to_auto(w: &AutoParamsWire, native_sender: &[u8]) -> AutoParams {
         data: w.data.clone(),
         native_sender: native_sender.to_vec(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// EVM `autoParams` -> Borsh `AutoParamsWire` (audit round 4, LOW "relayer
+// ignores auto_params").
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum AutoParamsError {
+    #[error("autoParams blob is not a valid abi.encode(AutoParamsTo): {0}")]
+    Malformed(&'static str),
+    /// The value exists on the EVM side but this VM cannot represent it: the
+    /// program hashes `execution_fee` as a `u128` and `flags` as a `u64`, so a
+    /// wider value produces an id the gate can never reproduce (see the I-1 note
+    /// on `submission_id` in `solana-gate`). Such a transfer is unclaimable AND
+    /// uncancellable on Solana; the source must be refunded by other means.
+    #[error("autoParams {field} exceeds what the Solana gate can encode")]
+    Unrepresentable { field: &'static str },
+}
+
+/// Read one 32-byte ABI word at `at`.
+fn abi_word(data: &[u8], at: usize) -> Result<[u8; 32], AutoParamsError> {
+    data.get(at..at + 32)
+        .and_then(|w| w.try_into().ok())
+        .ok_or(AutoParamsError::Malformed("truncated word"))
+}
+
+/// A word that must fit `usize` (an offset or a length).
+fn abi_usize(data: &[u8], at: usize) -> Result<usize, AutoParamsError> {
+    let w = abi_word(data, at)?;
+    if w[..24].iter().any(|b| *b != 0) {
+        return Err(AutoParamsError::Malformed("offset/length too large"));
+    }
+    Ok(u64::from_be_bytes(w[24..].try_into().unwrap()) as usize)
+}
+
+/// A dynamic `bytes` whose head word (at `head`) holds its offset relative to
+/// `base`.
+fn abi_bytes(data: &[u8], base: usize, head: usize) -> Result<Vec<u8>, AutoParamsError> {
+    let off = base
+        .checked_add(abi_usize(data, head)?)
+        .ok_or(AutoParamsError::Malformed("offset overflow"))?;
+    let len = abi_usize(data, off)?;
+    let start = off + 32;
+    data.get(start..start.checked_add(len).ok_or(AutoParamsError::Malformed("length overflow"))?)
+        .map(|b| b.to_vec())
+        .ok_or(AutoParamsError::Malformed("bytes run past the blob"))
+}
+
+/// Decode the `abi.encode(AutoParamsTo)` blob a `Sent` event carries into the
+/// Borsh form the Solana gate hashes.
+///
+/// `AutoParamsTo` is `(uint256 executionFee, uint256 flags, bytes fallbackAddress,
+/// bytes data)`. Because the struct has dynamic members, `abi.encode` emits ONE
+/// head word — the offset of the tuple (always 0x20) — followed by the tuple:
+/// two static words, two offset words (relative to the tuple start), then the
+/// two length-prefixed byte strings.
+///
+/// `Ok(None)` is "no execution payload" (an empty blob) — the store already
+/// treats `0x` this way. An `Err` MUST be handled by skipping the transfer, never
+/// by folding to `None`: the plain and with-auto ids for the same transfer are
+/// different hashes, so a claim built with `auto: None` for a with-auto record
+/// fails `NotEnoughSignatures` on-chain every poll, burning fees forever. That
+/// is exactly what the relayer used to do.
+///
+/// Hand-rolled because this crate is alloy-free by design (see `Cargo.toml`);
+/// the test suite pins it against alloy's own `abi_encode` of the same struct.
+pub fn decode_evm_auto_params(blob: &[u8]) -> Result<Option<AutoParamsWire>, AutoParamsError> {
+    if blob.is_empty() {
+        return Ok(None);
+    }
+    let base = abi_usize(blob, 0)?;
+    if base != 32 {
+        return Err(AutoParamsError::Malformed("tuple offset is not 0x20"));
+    }
+    let fee = abi_word(blob, base)?;
+    let flags = abi_word(blob, base + 32)?;
+    if fee[..16].iter().any(|b| *b != 0) {
+        return Err(AutoParamsError::Unrepresentable { field: "executionFee" });
+    }
+    if flags[..24].iter().any(|b| *b != 0) {
+        return Err(AutoParamsError::Unrepresentable { field: "flags" });
+    }
+    let fallback_address = abi_bytes(blob, base, base + 64)?;
+    let data = abi_bytes(blob, base, base + 96)?;
+    Ok(Some(AutoParamsWire {
+        execution_fee: u128::from_be_bytes(fee[16..].try_into().unwrap()),
+        flags: u64::from_be_bytes(flags[24..].try_into().unwrap()),
+        fallback_address,
+        data,
+    }))
 }
 
 /// Build the Borsh `Claim` instruction the keeper submits to the Solana gate.
@@ -598,6 +712,7 @@ mod tests {
             source_token: [0x88; 32],
             mint,
             amount: event.amount,
+            locked_at: 1_700_000_000,
         };
         (event, record)
     }
@@ -683,6 +798,20 @@ mod tests {
         );
     }
 
+    /// A record written before `locked_at` existed still corroborates the event
+    /// (the lock happened) and reads an unknown lock time as 0.
+    #[test]
+    fn a_legacy_record_is_accepted_with_an_unknown_lock_time() {
+        let (event, record) = event_and_record();
+        let full = borsh::to_vec(&record).unwrap();
+        let legacy = &full[..LEGACY_SENT_RECORD_LEN];
+        let got = verify_sent_record(Some((true, legacy)), &event).expect("legacy decodes");
+        assert_eq!(got.amount, record.amount);
+        assert_eq!(got.locked_at, 0);
+        assert_eq!(decode_sent_record(&full).unwrap().locked_at, record.locked_at);
+        assert!(decode_sent_record(&full[..50]).is_none());
+    }
+
     #[test]
     fn a_wrong_sized_record_is_refused() {
         let (event, _) = event_and_record();
@@ -703,5 +832,115 @@ mod tests {
         // The bytes decode into a SentEvent, but converting to a Sent rejects it.
         let ev2 = parse_sent_event_line(&line).unwrap().unwrap();
         assert!(ev2.to_sent().is_err(), "unknown version must be rejected");
+    }
+
+    // -----------------------------------------------------------------
+    // EVM autoParams -> AutoParamsWire (round 4, LOW)
+    // -----------------------------------------------------------------
+
+    /// Pinned against alloy's own encoder: whatever `abi.encode(AutoParamsTo)`
+    /// produces on the EVM side, this decoder must read back the same fields —
+    /// and the id recomputed from them must be the id the EVM gate emitted.
+    #[test]
+    fn evm_auto_params_decode_matches_alloy_encoding() {
+        use alloy::sol_types::SolValue;
+        use bridge_core::abi::AutoParamsTo;
+
+        for (fee, flags, fallback, data) in [
+            (0u128, 0u64, vec![], vec![]),
+            (1_000_000, 1, vec![0xAAu8; 20], vec![1, 2, 3]),
+            (u128::MAX, u64::MAX, vec![0xBB; 32], vec![0u8; 100]),
+            (7, 2, vec![], vec![0xCC; 33]), // non-word-aligned lengths
+        ] {
+            let encoded = AutoParamsTo {
+                executionFee: alloy_primitives::U256::from(fee),
+                flags: alloy_primitives::U256::from(flags),
+                fallbackAddress: fallback.clone().into(),
+                data: data.clone().into(),
+            }
+            .abi_encode();
+
+            let wire = decode_evm_auto_params(&encoded).expect("decodes").expect("is Some");
+            assert_eq!(wire.execution_fee, fee);
+            assert_eq!(wire.flags, flags);
+            assert_eq!(wire.fallback_address, fallback);
+            assert_eq!(wire.data, data);
+
+            // And the round trip through the hash form reproduces the EVM id.
+            let native_sender = vec![0x11u8; 20];
+            let auto = wire_to_auto(&wire, &native_sender);
+            let ours = crate::hash::submission_id_with_auto(
+                &[0xD0; 32], &[9; 32], &crate::hash::amount_word(500), 1337, 7565164, 3,
+                &[0xAB; 32], &auto,
+            );
+            let theirs = bridge_core::submission_id_with_auto(
+                alloy_primitives::B256::from([0xD0; 32]),
+                alloy_primitives::B256::from([9u8; 32]),
+                alloy_primitives::U256::from(500u64),
+                alloy_primitives::U256::from(1337u64),
+                alloy_primitives::U256::from(7565164u64),
+                alloy_primitives::U256::from(3u64),
+                &[0xAB; 32],
+                &bridge_core::decode_auto_params(&encoded, &native_sender).unwrap().unwrap(),
+            );
+            assert_eq!(ours, theirs.0, "id from decoded auto-params diverged from bridge-core");
+        }
+    }
+
+    #[test]
+    fn an_empty_blob_is_no_payload() {
+        assert_eq!(decode_evm_auto_params(&[]), Ok(None));
+    }
+
+    /// A payload the Solana gate cannot hash (fee >= 2^128, flags >= 2^64) is an
+    /// ERROR, not `None` — folding it to `None` would build a claim for a
+    /// different id and fail on-chain every poll.
+    #[test]
+    fn unrepresentable_values_are_errors_not_none() {
+        use alloy::sol_types::SolValue;
+        use bridge_core::abi::AutoParamsTo;
+
+        let wide_fee = AutoParamsTo {
+            executionFee: alloy_primitives::U256::from(u128::MAX) + alloy_primitives::U256::from(1u8),
+            flags: alloy_primitives::U256::ZERO,
+            fallbackAddress: vec![].into(),
+            data: vec![].into(),
+        }
+        .abi_encode();
+        assert_eq!(
+            decode_evm_auto_params(&wide_fee),
+            Err(AutoParamsError::Unrepresentable { field: "executionFee" })
+        );
+
+        let wide_flags = AutoParamsTo {
+            executionFee: alloy_primitives::U256::ZERO,
+            flags: alloy_primitives::U256::from(u64::MAX) + alloy_primitives::U256::from(1u8),
+            fallbackAddress: vec![].into(),
+            data: vec![].into(),
+        }
+        .abi_encode();
+        assert_eq!(
+            decode_evm_auto_params(&wide_flags),
+            Err(AutoParamsError::Unrepresentable { field: "flags" })
+        );
+    }
+
+    /// Garbage must be refused loudly, never read as an empty payload.
+    #[test]
+    fn a_malformed_blob_is_an_error() {
+        assert!(matches!(decode_evm_auto_params(&[0u8; 31]), Err(AutoParamsError::Malformed(_))));
+        assert!(matches!(decode_evm_auto_params(&[0u8; 64]), Err(AutoParamsError::Malformed(_))));
+        // A plausible head whose byte strings run off the end.
+        let mut truncated = vec![0u8; 32];
+        truncated[31] = 0x20;
+        truncated.extend_from_slice(&[0u8; 64]); // fee, flags
+        let mut off = [0u8; 32];
+        off[31] = 0x80;
+        truncated.extend_from_slice(&off); // fallback offset
+        truncated.extend_from_slice(&off); // data offset
+        let mut len = [0u8; 32];
+        len[31] = 200; // claims 200 bytes that are not there
+        truncated.extend_from_slice(&len);
+        assert!(matches!(decode_evm_auto_params(&truncated), Err(AutoParamsError::Malformed(_))));
     }
 }

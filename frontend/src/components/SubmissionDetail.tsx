@@ -5,11 +5,12 @@ import { chainViz, formatUnits, shortHex } from "../data/format";
 import { fetchHistory, fetchSubmission } from "../api/client";
 import { usePoll } from "../api/hooks";
 import type { Chain, HistoryEntry, Submission } from "../api/types";
-import { useChainDecimals } from "./useChainDecimals";
+import { useChainDecimals, type DecimalsProvider } from "./useChainDecimals";
 
 interface Props {
   submissionId: string;
   chains: Chain[];
+  wallet?: DecimalsProvider | null;
   onClose: () => void;
 }
 
@@ -26,13 +27,13 @@ function chainName(chains: Chain[], id: number) {
   return chains.find((c) => c.chainId === id)?.name ?? `Chain ${id}`;
 }
 
-export function SubmissionDetail({ submissionId, chains, onClose }: Props) {
+export function SubmissionDetail({ submissionId, chains, wallet, onClose }: Props) {
   const { data, error, loading } = usePoll<Submission | null>(
     () => fetchSubmission(submissionId),
     [submissionId],
     6000
   );
-  const decimalsByChain = useChainDecimals(chains);
+  const decimalsByChain = useChainDecimals(chains, wallet);
 
   // Best-effort: only populated when graphql-api was started with --store-url.
   const { data: historyRows } = usePoll<HistoryEntry[]>(

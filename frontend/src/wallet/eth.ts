@@ -4,8 +4,16 @@
 // Gate.send — small enough to hand-encode reliably. Selectors were taken from
 // `cast sig` and are asserted by the contract ABIs.
 
+import { b58decode } from "./solana";
+
 /** An EIP-1193 `request` function (from the connected wallet). */
 export type Eip1193Request = (args: { method: string; params?: unknown[] }) => Promise<unknown>;
+
+/** The widest amount a 32-byte (Solana) receiver can carry: `ClaimArgs.amount`
+ *  and `CancelArgs.amount` on the Solana gate are `u64`, so `Gate.send` reverts
+ *  `AmountTooWide` above this (H-3). Anything wider would be neither claimable
+ *  nor cancellable — locked forever — which is why it is refused here too. */
+export const U64_MAX = (1n << 64n) - 1n;
 
 const SEL = {
   approve: "095ea7b3", // approve(address,uint256)
@@ -58,6 +66,20 @@ function hexToBigInt(h: string): bigint {
   return BigInt(h);
 }
 
+/** A bridge receiver as the `bytes` the Gate expects: a `0x` hex string is
+ *  passed through (20 bytes for an EVM destination, 32 for Solana), and a
+ *  base58 Solana account key is decoded to exactly 32 bytes. The shape check is
+ *  strict on purpose — a key that decodes to 31 or 33 bytes is a typo, not a
+ *  different address, and the Gate would accept and lock funds against it. */
+export function encodeReceiver(receiver: string): string {
+  const v = receiver.trim();
+  if (v.startsWith("0x") || v.startsWith("0X")) return v;
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(v)) throw new Error(`bad receiver: ${receiver}`);
+  const bytes = b58decode(v);
+  if (bytes.length !== 32) throw new Error(`bad Solana receiver: decodes to ${bytes.length} bytes, need 32`);
+  return "0x" + Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 // --- calldata builders ---------------------------------------------------
 
 export function encodeApprove(spender: string, amount: bigint): string {
@@ -86,9 +108,16 @@ export function encodeSend(
   token: string,
   amount: bigint,
   chainIdTo: bigint,
-  receiverHex: string,
+  receiver: string,
   autoParamsHex: string
 ): string {
+  // `receiver` is 0x-hex or a base58 Solana key (see encodeReceiver).
+  const receiverHex = encodeReceiver(receiver);
+  // Mirror of Gate.send's H-3 check: a 32-byte receiver is a Solana account,
+  // and the Solana gate's amount is u64.
+  if (strip0x(receiverHex).length === 64 && amount > U64_MAX) {
+    throw new Error(`amount ${amount} exceeds 2^64-1, the widest a Solana receiver can claim (AmountTooWide)`);
+  }
   // head: token, amount, chainIdTo, off(receiver), off(autoParams) => 5 words.
   const recvTail = encBytesTail(receiverHex);
   const autoTail = encBytesTail(autoParamsHex || "0x");
@@ -339,7 +368,7 @@ export function sendBridge(
   token: string,
   amount: bigint,
   chainIdTo: number,
-  receiverHex: string,
+  receiver: string,
   chainIdFrom: number,
   autoParamsHex = "0x"
 ): Promise<string> {
@@ -347,7 +376,7 @@ export function sendBridge(
     req,
     from,
     gate,
-    encodeSend(token, amount, BigInt(chainIdTo), receiverHex, autoParamsHex),
+    encodeSend(token, amount, BigInt(chainIdTo), receiver, autoParamsHex),
     chainIdFrom
   );
 }

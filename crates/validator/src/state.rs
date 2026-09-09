@@ -76,6 +76,7 @@ impl PauseReason {
     }
 }
 
+#[derive(Debug)]
 pub struct Runtime {
     pub persist: Persist,
     path: PathBuf,
@@ -85,21 +86,34 @@ impl Runtime {
     /// Load persisted state if present, else start fresh from `start_block`
     /// (the first block we'd scan is `last_block + 1`, so seed `last_block`
     /// with `start_block.saturating_sub(1)`).
+    ///
+    /// A file that EXISTS but does not parse is a hard error, not a fresh start
+    /// (audit 2026-09-09, "corrupt/zero-length state file clears a persisted
+    /// pause"). The file is where a safety stop lives across restarts; treating
+    /// a truncated or garbled one as "no state" would silently clear that stop
+    /// — the exact failure `Persist::paused` exists to prevent — and would also
+    /// rewind the cursor to `start_block`, re-signing history. An operator has
+    /// to look at it: move it aside (accepting a rescan from `start_block`) or
+    /// restore it. Only a MISSING file means fresh.
     pub fn load_or_init(path: &Path, start_block: u64) -> anyhow::Result<Self> {
         let fresh = || Persist {
             last_block: start_block.saturating_sub(1),
             ..Default::default()
         };
         let persist = if path.exists() {
-            let raw = std::fs::read_to_string(path)?;
-            // Tolerate an unreadable/old-format state file: re-scanning from
-            // start_block is safe (signing is idempotent — the store dedups by
-            // signer), whereas hard-failing would brick the validator. This also
-            // covers the pre-mesh `nonces: {"<to>": n}` format transparently.
-            serde_json::from_str(&raw).unwrap_or_else(|e| {
-                tracing::warn!(path = %path.display(), error = %e, "unreadable state file; starting fresh");
-                fresh()
-            })
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("reading state file {}: {e}", path.display()))?;
+            serde_json::from_str(&raw).map_err(|e| {
+                anyhow::anyhow!(
+                    "state file {} exists but is not valid scanner state ({e}; {} bytes). \
+                     REFUSING TO START: it may hold a persisted safety stop, and starting \
+                     fresh would clear it and rewind the cursor to start_block. Restore the \
+                     file from backup, or move it aside to deliberately rescan from block {}.",
+                    path.display(),
+                    raw.len(),
+                    start_block
+                )
+            })?
         } else {
             fresh()
         };
@@ -126,17 +140,36 @@ impl Runtime {
         self.persist.last_block + 1
     }
 
-    /// Atomically persist (write temp + rename) so a crash mid-write can't
-    /// corrupt the cursor.
+    /// Atomically persist (write temp + fsync + rename) so a crash mid-write
+    /// can't corrupt the cursor.
+    ///
+    /// The fsync matters: `rename` is atomic with respect to the directory
+    /// entry, but without `sync_all` the new inode's DATA may still be in the
+    /// page cache when the entry is swapped, and a power loss then leaves a
+    /// correctly-named ZERO-LENGTH file — which `load_or_init` now refuses,
+    /// rather than reading as "fresh" and clearing a persisted pause.
     pub fn save(&self) -> anyhow::Result<()> {
+        use std::io::Write;
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
             }
         }
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_string_pretty(&self.persist)?)?;
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(serde_json::to_string_pretty(&self.persist)?.as_bytes())?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, &self.path)?;
+        // Best effort: also flush the directory so the rename itself is durable.
+        // Not every filesystem allows opening a directory for sync; a failure
+        // here is not worth failing the save over, the data is already on disk.
+        if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 
@@ -332,6 +365,61 @@ mod tests {
         assert_eq!(r.next_block(), 50);
         assert!(r.persist.nonces.is_empty());
         assert!(!r.paused());
+    }
+
+    fn temp_state(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("val-state-test-{tag}-{}.json", std::process::id()))
+    }
+
+    /// THE regression (audit 2026-09-09). A truncated or garbled state file used
+    /// to load as `fresh()`: not paused, cursor at start_block. A crash-loop with
+    /// a half-written file therefore cleared a safety stop nobody had cleared.
+    #[test]
+    fn a_corrupt_state_file_refuses_to_load() {
+        let path = temp_state("corrupt");
+        for garbage in ["", "{", "not json", "\0\0\0\0", "{\"last_block\": \"nope\"}"] {
+            std::fs::write(&path, garbage).unwrap();
+            let err = Runtime::load_or_init(&path, 100).unwrap_err().to_string();
+            assert!(err.contains("REFUSING TO START"), "garbage {garbage:?}: {err}");
+            assert!(err.contains(&path.display().to_string()), "names the file: {err}");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The other half of the contract: a MISSING file is still a fresh start.
+    #[test]
+    fn a_missing_state_file_is_fresh() {
+        let path = temp_state("missing");
+        let _ = std::fs::remove_file(&path);
+        let r = Runtime::load_or_init(&path, 100).unwrap();
+        assert_eq!(r.next_block(), 100);
+        assert!(!r.paused());
+    }
+
+    /// Old state files without the pause keys must still load (serde defaults),
+    /// so upgrading does not trip the corrupt-file refusal.
+    #[test]
+    fn a_pre_pause_state_file_still_loads() {
+        let path = temp_state("old-format");
+        std::fs::write(&path, r#"{"last_block": 41, "nonces": {"1337": {"1338": 3}}}"#).unwrap();
+        let r = Runtime::load_or_init(&path, 0).unwrap();
+        assert_eq!(r.next_block(), 42);
+        assert!(!r.paused());
+        assert_eq!(r.last_nonce(1337, 1338), Some(3));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `save` leaves no temp file behind and the result reloads.
+    #[test]
+    fn save_is_atomic_and_reloadable() {
+        let path = temp_state("save");
+        let _ = std::fs::remove_file(&path);
+        let mut r = Runtime::load_or_init(&path, 0).unwrap();
+        r.persist.last_block = 7;
+        r.save().unwrap();
+        assert!(!path.with_extension("json.tmp").exists(), "temp file must be renamed away");
+        assert_eq!(Runtime::load_or_init(&path, 0).unwrap().next_block(), 8);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -20,14 +20,20 @@
 //!          [--max-validators N] [--max-corridors N] [--guardian <pubkey>]
 //!     register-corridor --chain-id-to N
 //!     register-asset --debridge-id 0x.. --mint <pubkey> --vault <pubkey>
-//!     set-threshold --threshold N
+//!     set-threshold --threshold N            (a DECREASE needs a matured schedule)
 //!     set-validator --validator 0x.. --active <bool>
+//!                                            (an ADDITION needs a matured schedule)
+//!     schedule-governance (--add-validator 0x.. | --lower-threshold N | --action-id 0x..)
+//!     cancel-governance   (--add-validator 0x.. | --lower-threshold N | --action-id 0x..)
+//!     governance-status   (--add-validator 0x.. | --lower-threshold N | --action-id 0x..)
 //!     send --debridge-id 0x.. --amount N --chain-id-to N --receiver 0x..
 //!          --from-token-account <pubkey>
 //!     cancel --debridge-id 0x.. --amount N --chain-id-from N --nonce N
 //!            --receiver 0x.. --native-sender 0x.. --signature 0x.. [--signature 0x..]
-//!     refund --debridge-id 0x.. --amount N --chain-id-to N --nonce N
-//!            --receiver 0x.. --native-sender 0x.. --to-token-account <pubkey>
+//!     refund --submission-id 0x.. --debridge-id 0x.. --amount N --chain-id-to N
+//!            --nonce N --receiver 0x.. --native-sender 0x..
+//!            [--to-token-account <pubkey>]   (default: the account `send` debited,
+//!                                             read from the ["sent", id] record)
 //!            --signature 0x.. [--signature 0x..]
 //!     digest --submission-id 0x.. — print the cancel/refund digests to sign
 //!     show
@@ -37,14 +43,31 @@
 //! could mint them would be a tool that could burn or claw back any transfer.
 //! Use `digest` to get the bytes, sign them with the validator keys wherever
 //! those live, and pass the results back.
+//!
+//! ## Governance timelock (audit round 4, H-2)
+//!
+//! Adding a validator or LOWERING the threshold grants signing power, so the
+//! program makes it wait: `schedule-governance` first, then 48 h later the
+//! `set-validator` / `set-threshold` call consumes the schedule (and must land
+//! within the 7-day grace window or be re-scheduled). Removing a validator and
+//! RAISING the threshold are instant. `set-validator`/`set-threshold` print the
+//! action id they need, so a refused call tells you what to schedule.
+//!
+//! The program UPGRADE authority cannot be timelocked by the program itself:
+//! put it behind a Squads / SPL-Governance timelock before any production use.
 
 use std::str::FromStr;
 
-use bridge_solana::instruction::{GateInstruction, InitArgs};
+use bridge_solana::instruction::{
+    add_validator_action_id, lower_threshold_action_id, GateInstruction, GovernanceSchedule,
+    InitArgs, GOVERNANCE_DELAY_SECS, GOVERNANCE_GRACE_SECS,
+};
+use borsh::BorshDeserialize as _;
 use solana_relayer::gate::{
     decode_config_view, domain_id, hex20, hex32, ConfigTail, BPF_LOADER_UPGRADEABLE,
     CANCEL_PREFIX, REFUND_PREFIX, SPL_TOKEN,
 };
+use solana_relayer::target::refund_accounts;
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::instruction::{AccountMeta, Instruction};
@@ -67,6 +90,24 @@ fn parse_sigs(args: &Args) -> anyhow::Result<Vec<Vec<u8>>> {
         anyhow::ensure!(s.len() == 65, "each signature must be 65 bytes, got {}", s.len());
     }
     Ok(out)
+}
+
+/// The governance action id a `schedule-governance` / `cancel-governance` /
+/// `governance-status` call names: exactly one of `--add-validator 0x..`,
+/// `--lower-threshold N` or a raw `--action-id 0x..`.
+fn governance_action_id(args: &Args) -> anyhow::Result<[u8; 32]> {
+    match (args.get("--add-validator"), args.get("--lower-threshold"), args.get("--action-id")) {
+        (Some(v), None, None) => Ok(add_validator_action_id(&hex20(&v)?)),
+        (None, Some(t), None) => Ok(lower_threshold_action_id(t.parse()?)),
+        (None, None, Some(a)) => hex32(&a),
+        _ => anyhow::bail!(
+            "name exactly one action: --add-validator 0x.. | --lower-threshold N | --action-id 0x.."
+        ),
+    }
+}
+
+fn gov_pda(program_id: &Pubkey, action_id: &[u8; 32]) -> Pubkey {
+    Pubkey::find_program_address(&[b"gov", action_id], program_id).0
 }
 
 /// Minimal flag reader: `--name value`. Repeated flags collect.
@@ -121,6 +162,41 @@ fn main() -> anyhow::Result<()> {
         println!("Validators sign the EIP-191 digest of the id above — the same");
         println!("`personal_sign` shape as the EVM side, so `cast wallet sign` works:");
         println!("  cast wallet sign --private-key <key> <cancelId|refundId>");
+        return Ok(());
+    }
+
+    if cmd == "governance-status" {
+        let action_id = governance_action_id(&args)?;
+        let pda = gov_pda(&program_id, &action_id);
+        println!("action id : 0x{}", hex::encode(action_id));
+        println!("gov PDA   : {pda}");
+        match rpc.get_account(&pda) {
+            Ok(acct) if acct.owner == program_id && acct.data.len() >= 8 => {
+                let sched = GovernanceSchedule::deserialize(&mut &acct.data[..])?;
+                if sched.ready_at == 0 {
+                    println!("status    : NOT SCHEDULED (consumed or cancelled)");
+                } else {
+                    let now = rpc
+                        .get_account(&solana_sdk::sysvar::clock::id())
+                        .ok()
+                        .and_then(|a| solana_sdk::account::from_account::<solana_sdk::clock::Clock, _>(&a))
+                        .map(|c| c.unix_timestamp);
+                    println!("ready_at  : {} (unix, cluster clock)", sched.ready_at);
+                    println!("expires   : {}", sched.ready_at + GOVERNANCE_GRACE_SECS);
+                    match now {
+                        Some(now) if now < sched.ready_at => {
+                            println!("status    : SCHEDULED, matures in {}s", sched.ready_at - now)
+                        }
+                        Some(now) if now > sched.ready_at + GOVERNANCE_GRACE_SECS => {
+                            println!("status    : EXPIRED — re-run schedule-governance")
+                        }
+                        Some(_) => println!("status    : READY — execute set-validator / set-threshold now"),
+                        None => println!("status    : scheduled (could not read the cluster clock)"),
+                    }
+                }
+            }
+            _ => println!("status    : NOT SCHEDULED"),
+        }
         return Ok(());
     }
 
@@ -254,14 +330,58 @@ fn main() -> anyhow::Result<()> {
                 ],
             )
         }
-        "set-threshold" => (
-            GateInstruction::SetThreshold { threshold: args.req("--threshold")?.parse()? }
-                .to_bytes(),
-            vec![
-                AccountMeta::new(config_pda, false),
-                AccountMeta::new_readonly(payer.pubkey(), true),
-            ],
-        ),
+        // A DECREASE consumes `["gov", lower_threshold_action_id(t)]`; an increase
+        // ignores the extra account. Always attached, so the same command works
+        // in both directions, and the action id is printed for the schedule step.
+        "set-threshold" => {
+            let threshold: u32 = args.req("--threshold")?.parse()?;
+            let action_id = lower_threshold_action_id(threshold);
+            println!("lowerThreshold action id: 0x{}", hex::encode(action_id));
+            println!(
+                "(a DECREASE needs `schedule-governance --lower-threshold {threshold}` {}h earlier; an increase is instant)",
+                GOVERNANCE_DELAY_SECS / 3600
+            );
+            (
+                GateInstruction::SetThreshold { threshold }.to_bytes(),
+                vec![
+                    AccountMeta::new(config_pda, false),
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(gov_pda(&program_id, &action_id), false),
+                ],
+            )
+        }
+        // H-2 (round 4): queue a validator addition / threshold decrease.
+        "schedule-governance" => {
+            let action_id = governance_action_id(&args)?;
+            println!("scheduling action 0x{}", hex::encode(action_id));
+            println!(
+                "matures {}h after this lands; execute within the following {}-day grace window",
+                GOVERNANCE_DELAY_SECS / 3600,
+                GOVERNANCE_GRACE_SECS / 86_400
+            );
+            (
+                GateInstruction::ScheduleGovernance { action_id }.to_bytes(),
+                vec![
+                    AccountMeta::new_readonly(config_pda, false),
+                    AccountMeta::new(payer.pubkey(), true),
+                    AccountMeta::new(gov_pda(&program_id, &action_id), false),
+                    AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+                ],
+            )
+        }
+        // Owner OR guardian.
+        "cancel-governance" => {
+            let action_id = governance_action_id(&args)?;
+            println!("cancelling scheduled action 0x{}", hex::encode(action_id));
+            (
+                GateInstruction::CancelScheduledGovernance { action_id }.to_bytes(),
+                vec![
+                    AccountMeta::new_readonly(config_pda, false),
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(gov_pda(&program_id, &action_id), false),
+                ],
+            )
+        }
         // Solana -> EVM. Locks the caller's SPL tokens into the registered vault
         // and emits the `Sent` event the relayer signs.
         //
@@ -289,35 +409,23 @@ fn main() -> anyhow::Result<()> {
             // chain_id and the per-corridor nonce come from the config; the
             // program uses exactly these to build the id.
             let cfg_acct = rpc.get_account(&config_pda)?;
-            let d = &cfg_acct.data;
-            // Borsh Config layout, in declaration order and with no header:
-            //   owner(32) | bridge_domain(32) | guardian(32) | validators(4+20n) | …
-            // Adding a field ahead of these shifts every offset below, which is
-            // why the domain read and the length read are derived from the same
-            // running total rather than two independent magic numbers.
-            let bridge_domain: [u8; 32] = d[32..64].try_into()?;
-            let validators_off = 32 + 32 + 32;
-            let n = u32::from_le_bytes(
-                d[validators_off..validators_off + 4].try_into()?,
-            ) as usize;
-            let after_validators = validators_off + 4 + n * 20;
-            let chain_id = u64::from_le_bytes(
-                d[after_validators + 4..after_validators + 12].try_into()?,
-            );
-            // …then paused(1) max_validators(4) max_corridors(4), then nonce_to.
-            let nonce_off = after_validators + 12 + 1 + 4 + 4;
-            let entries = u32::from_le_bytes(d[nonce_off..nonce_off + 4].try_into()?) as usize;
-            let mut nonce = None;
-            for i in 0..entries {
-                let o = nonce_off + 4 + i * 16;
-                if u64::from_le_bytes(d[o..o + 8].try_into()?) == chain_id_to {
-                    nonce = Some(u64::from_le_bytes(d[o + 8..o + 16].try_into()?));
-                    break;
-                }
-            }
-            let nonce = nonce.ok_or_else(|| {
-                anyhow::anyhow!("corridor {chain_id_to} is not registered — run register-corridor")
-            })?;
+            // Through the ONE mirrored layout (`gate::ConfigView` + `ConfigTail`),
+            // never hand-sliced offsets — that is how `show` once reported zeros
+            // after `bridge_domain` was inserted.
+            let mut cursor: &[u8] = &cfg_acct.data;
+            let view = decode_config_view(&mut cursor)?;
+            let tail = ConfigTail::deserialize(&mut cursor)
+                .map_err(|e| anyhow::anyhow!("config tail does not decode: {e}"))?;
+            let bridge_domain = view.bridge_domain;
+            let chain_id = view.chain_id;
+            let nonce = tail
+                .nonce_to
+                .iter()
+                .find(|(c, _)| *c == chain_id_to)
+                .map(|(_, n)| *n)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("corridor {chain_id_to} is not registered — run register-corridor")
+                })?;
 
             // No auto-params here, so `native_sender` is NOT part of the hash —
             // it only enters via `keccak(nativeSender)` in the auto tail, exactly
@@ -418,7 +526,6 @@ fn main() -> anyhow::Result<()> {
                 signatures: parse_sigs(&args)?,
             };
             let id = hex32(&args.req("--submission-id")?)?;
-            let to_token = Pubkey::from_str(&args.req("--to-token-account")?)?;
             let (asset_pda, _) =
                 Pubkey::find_program_address(&[b"asset", &debridge_id], &program_id);
             let (sent_pda, _) = Pubkey::find_program_address(&[b"sent", &id], &program_id);
@@ -427,34 +534,66 @@ fn main() -> anyhow::Result<()> {
             let asset_acct = rpc.get_account(&asset_pda)?;
             anyhow::ensure!(asset_acct.data.len() >= 96, "asset account is malformed");
             let vault = Pubkey::new_from_array(asset_acct.data[64..96].try_into()?);
-            println!("refunding {} from vault {vault}", hex::encode(id));
+
+            // The payout destination is the token account `send` debited, recorded
+            // by the program in `["sent", id]` — so it can be read rather than
+            // typed. An explicit `--to-token-account` still has to MATCH it, or the
+            // program refuses; pass it only as a cross-check.
+            let sent_acct = rpc
+                .get_account(&sent_pda)
+                .map_err(|_| anyhow::anyhow!("no [\"sent\", id] record: this gate never sent {}", hex::encode(id)))?;
+            anyhow::ensure!(sent_acct.owner == program_id, "sent record is not program-owned");
+            let record = bridge_solana::relayer::decode_sent_record(&sent_acct.data)
+                .ok_or_else(|| anyhow::anyhow!("sent record does not decode (layout drift?)"))?;
+            anyhow::ensure!(record.amount != 0, "sent record is zeroed: already refunded");
+            let recorded_to = Pubkey::new_from_array(record.source_token);
+            let to_token = match args.get("--to-token-account") {
+                Some(t) => {
+                    let t = Pubkey::from_str(&t)?;
+                    anyhow::ensure!(t == recorded_to, "--to-token-account {t} != recorded {recorded_to}");
+                    t
+                }
+                None => recorded_to,
+            };
+            println!("refunding {} : {} units from vault {vault} -> {to_token}", hex::encode(id), record.amount);
+            println!("locked_at    : {} (cluster unix time)", record.locked_at);
             (
                 GateInstruction::Refund(a).to_bytes(),
+                refund_accounts(
+                    config_pda,
+                    asset_pda,
+                    sent_pda,
+                    refunded_pda,
+                    payer.pubkey(),
+                    vault,
+                    to_token,
+                    vault_authority,
+                ),
+            )
+        }
+        // An ADDITION consumes `["gov", add_validator_action_id(v)]`; a removal
+        // is instant and ignores the extra account.
+        "set-validator" => {
+            let validator = hex20(&args.req("--validator")?)?;
+            let active = args.get("--active").unwrap_or_else(|| "true".into()) == "true";
+            let action_id = add_validator_action_id(&validator);
+            println!("addValidator action id: 0x{}", hex::encode(action_id));
+            if active {
+                println!(
+                    "(an ADDITION needs `schedule-governance --add-validator 0x{}` {}h earlier; removal is instant)",
+                    hex::encode(validator),
+                    GOVERNANCE_DELAY_SECS / 3600
+                );
+            }
+            (
+                GateInstruction::SetValidator { validator, active }.to_bytes(),
                 vec![
-                    AccountMeta::new_readonly(config_pda, false),
-                    AccountMeta::new_readonly(asset_pda, false),
-                    AccountMeta::new(sent_pda, false),
-                    AccountMeta::new(refunded_pda, false),
-                    AccountMeta::new(payer.pubkey(), true),
-                    AccountMeta::new(vault, false),
-                    AccountMeta::new(to_token, false),
-                    AccountMeta::new_readonly(vault_authority, false),
-                    AccountMeta::new_readonly(Pubkey::from_str(SPL_TOKEN)?, false),
-                    AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+                    AccountMeta::new(config_pda, false),
+                    AccountMeta::new_readonly(payer.pubkey(), true),
+                    AccountMeta::new(gov_pda(&program_id, &action_id), false),
                 ],
             )
         }
-        "set-validator" => (
-            GateInstruction::SetValidator {
-                validator: hex20(&args.req("--validator")?)?,
-                active: args.get("--active").unwrap_or_else(|| "true".into()) == "true",
-            }
-            .to_bytes(),
-            vec![
-                AccountMeta::new(config_pda, false),
-                AccountMeta::new_readonly(payer.pubkey(), true),
-            ],
-        ),
         other => anyhow::bail!("unknown command {other:?}"),
     };
 

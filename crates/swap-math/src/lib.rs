@@ -32,6 +32,12 @@ construct_uint! {
 pub const PRICE_ONE: u128 = 1_000_000_000_000_000_000;
 /// Basis-point denominator for the fee and the price-deviation guard.
 pub const BPS_DENOM: u16 = 10_000;
+/// The largest swap fee the pool accepts (10 %), as `SwapPool.setFee` caps it:
+/// far enough below 100 % that a fee alone can never round a payout to zero.
+pub const MAX_FEE_BPS: u16 = 1_000;
+/// How old a token's price may be before a swap or quote refuses it, unless the
+/// owner has set something else — one day, as `SwapPool`'s constructor sets.
+pub const DEFAULT_MAX_PRICE_AGE: i64 = 86_400;
 
 /// `floor(a * b / d)` — OpenZeppelin `Math.mulDiv` with the default (floor)
 /// rounding. `None` on a zero divisor or a result past `u128`.
@@ -184,6 +190,39 @@ pub struct PoolState {
     pub max_price_deviation_bps: u16,
     pub min_price_update_interval: i64,
     pub paused: bool,
+    /// How old a token's price may be (seconds) before `swap`/`quote` refuse it
+    /// — `SwapPool.maxPriceAge`. The rate limits above bound how fast a price
+    /// may MOVE; only this bounds how OLD it may be, so a halted oracle stops
+    /// the pool instead of leaving it quoting yesterday's figure.
+    ///
+    /// `0` means "not configured" and reads as [`DEFAULT_MAX_PRICE_AGE`] —
+    /// see [`PoolState::effective_max_price_age`]. That is deliberately NOT the
+    /// Solidity meaning (there `0` disables the check): this field was added to
+    /// a live layout, so every pool initialized before it decodes as `0`, and a
+    /// value that silently switched the guard OFF for exactly those pools would
+    /// invert the point of adding it. To relax the guard, set it very large.
+    pub max_price_age: i64,
+}
+
+impl PoolState {
+    /// The staleness bound actually enforced: the configured value, or the
+    /// default for a pool whose record predates the field.
+    pub fn effective_max_price_age(&self) -> i64 {
+        if self.max_price_age > 0 { self.max_price_age } else { DEFAULT_MAX_PRICE_AGE }
+    }
+
+    /// Whether a token priced at `set_at` may be traded at `now`. The hub mint is
+    /// always fresh: its price is pinned and there is no feed to go stale. The
+    /// check is the program's, exposed so an off-chain quote refuses exactly
+    /// what the chain would.
+    pub fn price_is_fresh(&self, token: &TokenState, now: i64) -> bool {
+        if token.mint == self.hub_mint {
+            return true;
+        }
+        // `set_at == 0` is a record that predates the field or was never
+        // stamped: older than any bound, so it fails closed until repriced.
+        now.saturating_sub(token.price_set_at) <= self.effective_max_price_age()
+    }
 }
 
 /// One listed mint (`["token", mint]` PDA). `reserve` is INTERNAL accounting —
@@ -196,14 +235,28 @@ pub struct TokenState {
     pub decimals: u8,
     pub price: u128,
     pub reserve: u64,
-    /// 0 = never repriced since listing; the first update is always allowed.
+    /// 0 = never repriced since listing; the first update skips the COOLDOWN
+    /// (never the deviation cap). Exists only to gate that cooldown.
     pub last_price_update: i64,
     pub listed: bool,
+    /// When the CURRENT price was established — stamped by listing as well as
+    /// by every reprice, unlike `last_price_update`. Read only by the
+    /// staleness guard ([`PoolState::price_is_fresh`]). A record written
+    /// before this field existed decodes as `0`, i.e. stale until repriced.
+    pub price_set_at: i64,
 }
 
-/// Borsh-serialized size of [`PoolState`], plus slack for a later field.
+/// Allocated size of a [`PoolState`] account. Its serialized form is 149
+/// bytes; the rest is zero padding reserved for later fields.
+///
+/// UNCHANGED when `max_price_age` was added: the field went into the slack, so
+/// pools initialized under the old layout need no realloc — they decode with
+/// the new field read from the padding as `0`, which the code treats as "not
+/// configured" (see the field's docs). Any future field must fit the remaining
+/// 24 bytes or bump this constant together with a migration.
 pub const POOL_SPACE: usize = 32 * 4 + 2 + 2 + 8 + 1 + 32;
-/// Borsh-serialized size of [`TokenState`], plus slack.
+/// Allocated size of a [`TokenState`] account. Serialized form is 106 bytes;
+/// `price_set_at` was added into the slack the same way (24 bytes remain).
 pub const TOKEN_SPACE: usize = 32 + 32 + 1 + 16 + 8 + 8 + 1 + 32;
 
 pub const POOL_SEED: &[u8] = b"pool";
@@ -247,6 +300,75 @@ mod layout_tests {
         let mut bytes = borsh::to_vec(&rec).unwrap();
         bytes.resize(TOKEN_SPACE, 0);
         assert_eq!(decode::<TokenState>(&bytes), Some(rec));
+    }
+
+    /// The exact byte sizes the docs on `POOL_SPACE`/`TOKEN_SPACE` promise, so a
+    /// field added later cannot silently overrun the slack.
+    #[test]
+    fn serialized_sizes_are_what_the_layout_docs_say() {
+        assert_eq!(borsh::to_vec(&PoolState::default()).unwrap().len(), 149);
+        assert_eq!(borsh::to_vec(&TokenState::default()).unwrap().len(), 106);
+    }
+
+    /// A record written by the PREVIOUS layout — every field up to `listed`,
+    /// then zero padding — must still decode, with the new fields reading as 0.
+    /// This is the on-chain migration for the devnet pool: no realloc.
+    #[test]
+    fn a_record_from_before_price_set_at_decodes_with_zero() {
+        // Hand-built old TokenState: mint, vault, decimals, price, reserve,
+        // last_price_update, listed — 98 bytes — then padding to TOKEN_SPACE.
+        let mut old = Vec::new();
+        old.extend_from_slice(&[7u8; 32]);
+        old.extend_from_slice(&[8u8; 32]);
+        old.push(9);
+        old.extend_from_slice(&(3180 * PRICE_ONE).to_le_bytes());
+        old.extend_from_slice(&42u64.to_le_bytes());
+        old.extend_from_slice(&1_700_000_000i64.to_le_bytes());
+        old.push(1);
+        assert_eq!(old.len(), 98);
+        old.resize(TOKEN_SPACE, 0);
+        let rec = decode::<TokenState>(&old).expect("old layout still decodes");
+        assert_eq!(rec.mint, [7u8; 32]);
+        assert_eq!(rec.price, 3180 * PRICE_ONE);
+        assert_eq!(rec.last_price_update, 1_700_000_000);
+        assert!(rec.listed);
+        assert_eq!(rec.price_set_at, 0, "new field reads from the padding");
+
+        // Same for the pool: owner, oracle, guardian, hub, fee, dev, interval,
+        // paused — 141 bytes.
+        let mut old = Vec::new();
+        for b in [1u8, 2, 3, 4] {
+            old.extend_from_slice(&[b; 32]);
+        }
+        old.extend_from_slice(&30u16.to_le_bytes());
+        old.extend_from_slice(&1000u16.to_le_bytes());
+        old.extend_from_slice(&3600i64.to_le_bytes());
+        old.push(0);
+        assert_eq!(old.len(), 141);
+        old.resize(POOL_SPACE, 0);
+        let pool = decode::<PoolState>(&old).expect("old layout still decodes");
+        assert_eq!(pool.fee_bps, 30);
+        assert_eq!(pool.max_price_age, 0);
+        assert_eq!(
+            pool.effective_max_price_age(),
+            DEFAULT_MAX_PRICE_AGE,
+            "an unconfigured pool fails closed at the default, never open"
+        );
+    }
+
+    #[test]
+    fn staleness_is_judged_the_way_solidity_judges_it() {
+        let hub = [4u8; 32];
+        let pool = PoolState { hub_mint: hub, max_price_age: 100, ..Default::default() };
+        let alt = TokenState { mint: [5u8; 32], price_set_at: 1_000, ..Default::default() };
+        assert!(pool.price_is_fresh(&alt, 1_100), "exactly max_age old is still fresh (<=)");
+        assert!(!pool.price_is_fresh(&alt, 1_101), "one second past is stale");
+        let never = TokenState { mint: [5u8; 32], price_set_at: 0, ..Default::default() };
+        assert!(!pool.price_is_fresh(&never, 1_000), "an unstamped record is stale");
+        let hub_rec = TokenState { mint: hub, price_set_at: 0, ..Default::default() };
+        assert!(pool.price_is_fresh(&hub_rec, i64::MAX), "the hub is exempt");
+        // A clock behind the stamp (skew) is fresh, not an underflow.
+        assert!(pool.price_is_fresh(&alt, 0));
     }
 }
 

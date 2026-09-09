@@ -57,6 +57,9 @@ contract SendTest is Test {
         address[] memory validators = new address[](1);
         validators[0] = address(0xA11CE);
         gate = deployTestGate(validators, 1);
+        // M-3: `send` refuses destinations the owner has not listed.
+        gate.setSupportedChain(CHAIN_TO, true);
+        gate.setSupportedChain(9999, true);
 
         token = new TestToken("Test", "TST");
         token.mint(user, 1_000 ether);

@@ -24,6 +24,16 @@
 //!     a given asset is pinned by the Asset PDA above, not by the authority seed.
 //!   * **Executed PDA** (`["executed", submissionId]`) — created on claim; its
 //!     existence is the replay guard (a second claim fails to init it).
+//!   * **Sent PDA** (`["sent", submissionId]`) — source-side origin proof and
+//!     refund destination, with the cluster time the funds were locked.
+//!   * **Governance PDA** (`["gov", actionId]`) — a pending validator addition or
+//!     threshold decrease and the time it matures (H-2, audit round 4). Adding
+//!     signing power waits 48 h behind `ScheduleGovernance`; removing it is
+//!     instant. The program UPGRADE authority cannot be delayed by the program
+//!     itself and must sit behind a Squads/SPL-Governance timelock.
+//!
+//! Every PDA above is created with `transfer + allocate + assign`, never
+//! `create_account`, so pre-funding an address cannot brick it (H-2 / M-5).
 //!
 //! ## The receiver MUST be an SPL token account (finding L-4)
 //!
@@ -159,6 +169,137 @@ pub enum GateInstruction {
     /// M-2, SOURCE side: return locked funds to the account that sent them, after
     /// the destination has been burned. Permissionless for the same reason.
     Refund(RefundArgs),
+    /// H-2 (audit round 4): queue a power-GRANTING governance action — adding a
+    /// validator or lowering the threshold — for execution once
+    /// [`GOVERNANCE_DELAY`] has elapsed. Owner only. Build `action_id` with
+    /// [`add_validator_action_id`] / [`lower_threshold_action_id`]. Mirrors
+    /// `Gate.scheduleGovernance`.
+    ///
+    /// Accounts: `[config, owner(s,w), gov_pda(w), system_program]` where
+    /// `gov_pda = ["gov", action_id]`.
+    ScheduleGovernance { action_id: [u8; 32] },
+    /// H-2: drop a queued governance action. Owner OR guardian, exactly as
+    /// `Gate.cancelScheduledGovernance`: spotting a bad pending validator
+    /// addition is incident response, and neither party can *execute* anything
+    /// this way, so the worst case is a delay.
+    ///
+    /// Accounts: `[config, signer(s), gov_pda(w)]`.
+    CancelScheduledGovernance { action_id: [u8; 32] },
+}
+
+// ---------------------------------------------------------------------------
+// Governance timelock (H-2, audit round 4) — mirrors Gate.sol `_consumeGovernance`.
+// ---------------------------------------------------------------------------
+
+/// How long a validator ADDITION or a threshold DECREASE must wait, in seconds.
+///
+/// THE SAME DEFENCE `Gate.sol` carries as `GOVERNANCE_DELAY`, for the same
+/// reason: an owner who can add a validator and lower the threshold in one
+/// transaction can sign a claim for every registered corridor and empty every
+/// vault — and because both legs share ONE validator set, the EVM gate's 48 h
+/// timelock was only ever as strong as this program's owner key. A constant, not
+/// an owner-settable field: an owner who could shorten it could zero it.
+pub const GOVERNANCE_DELAY: i64 = 48 * 60 * 60;
+
+/// How long a MATURED schedule stays spendable, in seconds. After
+/// `ready_at + GOVERNANCE_GRACE` it expires and must be re-scheduled.
+///
+/// Without an expiry a matured schedule is a banked instant right for life: a
+/// key stolen years later inherits every approval that was ever left lying
+/// around (audit round 4, LOW "matured schedules never expire"). Seven days is
+/// generous for an operator who scheduled on Monday and executes the following
+/// week, and useless to a thief who arrives in month six.
+pub const GOVERNANCE_GRACE: i64 = 7 * 24 * 60 * 60;
+
+/// **Program upgrade authority is NOT covered by this timelock, and cannot be.**
+///
+/// The BPF upgradeable loader decides who may swap the program's bytecode; the
+/// program itself cannot interpose a delay on that, and a new implementation
+/// could simply delete every rule in this file. Operators MUST therefore place
+/// the upgrade authority behind an external timelock — a Squads multisig with a
+/// time lock, or SPL-Governance — exactly as `Gate.sol`'s `UPGRADE_DELAY` gates
+/// UUPS upgrades on the EVM side. Deployment scripts should refuse a `production`
+/// deploy whose upgrade authority is a bare hot key.
+pub const UPGRADE_AUTHORITY_TIMELOCK_NOTE: &str =
+    "program upgrade authority must sit behind a Squads/SPL-Governance timelock; the program cannot delay its own upgrade";
+
+/// The per-action schedule, stored in the program-owned PDA `["gov", action_id]`.
+/// `ready_at == 0` means "not scheduled" — the same sentinel `Gate.sol` uses.
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct GovernanceSchedule {
+    /// Unix time (cluster clock) from which the action may be consumed.
+    pub ready_at: i64,
+}
+
+/// Borsh size of a [`GovernanceSchedule`].
+const GOVERNANCE_LEN: usize = 8;
+
+/// The action id for adding validator `v`: `keccak("addValidator" ‖ v)`.
+///
+/// Analogous to `Gate.addValidatorActionId` (which uses `abi.encode`); the ids
+/// are chain-local — a schedule on this gate authorises a change on this gate
+/// only — so the two encodings need not be byte-identical, only equally
+/// specific: a schedule commits to THIS validator, never to "some validator".
+pub fn add_validator_action_id(v: &[u8; 20]) -> [u8; 32] {
+    keccak::hashv(&[b"addValidator", v]).to_bytes()
+}
+
+/// The action id for lowering the threshold to exactly `t`:
+/// `keccak("lowerThreshold" ‖ uint256(t))`. A matured approval for `t = 2`
+/// cannot be spent on `t = 1`.
+pub fn lower_threshold_action_id(t: u32) -> [u8; 32] {
+    keccak::hashv(&[b"lowerThreshold", &be32(t as u64)]).to_bytes()
+}
+
+/// Pure timelock rule (host-testable): may a schedule with `ready_at` be
+/// consumed at cluster time `now`?
+///
+/// `ready_at == 0` is "never scheduled" (or already consumed/cancelled).
+/// `now < ready_at` is "scheduled but immature". `now > ready_at + GRACE` is
+/// "matured but left lying around too long" — refused, so a stale approval
+/// cannot be spent by whoever holds the owner key later.
+fn governance_consumable(ready_at: i64, now: i64) -> Result<(), GateError> {
+    if ready_at == 0 {
+        return Err(GateError::GovernanceNotScheduled);
+    }
+    if now < ready_at {
+        return Err(GateError::GovernanceNotReady);
+    }
+    if now > ready_at.saturating_add(GOVERNANCE_GRACE) {
+        return Err(GateError::GovernanceExpired);
+    }
+    Ok(())
+}
+
+/// Require a matured, unexpired schedule for `action_id` in `gov_ai`, then BURN
+/// it, so one approval authorises exactly one change. Mirrors
+/// `Gate._consumeGovernance`.
+///
+/// The account must be the canonical `["gov", action_id]` PDA and program-owned:
+/// anyone can park lamports (or their own data) at that address, and neither
+/// proves the owner ever scheduled anything.
+fn consume_governance(
+    program_id: &Pubkey,
+    gov_ai: &AccountInfo,
+    action_id: &[u8; 32],
+) -> ProgramResult {
+    let (expected, _bump) = Pubkey::find_program_address(&[b"gov", action_id], program_id);
+    if gov_ai.key != &expected {
+        msg!("governance account is not the canonical [\"gov\", action_id] PDA");
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if gov_ai.owner != program_id || gov_ai.data_len() < GOVERNANCE_LEN {
+        // Never created by ScheduleGovernance (a pre-funded squat, or nothing).
+        return Err(GateError::GovernanceNotScheduled.into());
+    }
+    let sched = GovernanceSchedule::deserialize(&mut &gov_ai.data.borrow()[..])
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    let now = solana_program::clock::Clock::get()?.unix_timestamp;
+    governance_consumable(sched.ready_at, now)?;
+    // Burn it: one schedule, one change.
+    GovernanceSchedule::default().serialize(&mut &mut gov_ai.data.borrow_mut()[..])?;
+    msg!("governance schedule consumed");
+    Ok(())
 }
 
 /// Everything needed to recompute a submissionId on the DESTINATION side, plus
@@ -354,10 +495,20 @@ pub struct SentRecord {
     pub source_token: Pubkey,
     pub mint: Pubkey,
     pub amount: u64,
+    /// Cluster unix time at which the funds were locked (M-4 / M-13).
+    ///
+    /// The Solana analogue of reading `Gate.sentBy` at an aged EVM block: a
+    /// refund attester needs an ON-CHAIN statement of how long a transfer has
+    /// been unclaimed before it may vote to burn it, and it must not take that
+    /// from the signature store's nomination. `Clock::get()` is the
+    /// stake-weighted cluster time, written here in the same transaction that
+    /// locks the funds, so `now - locked_at` (with `now` read from the Clock
+    /// sysvar, not a wall clock) is an authenticated age.
+    pub locked_at: i64,
 }
 
-/// Borsh size of a [`SentRecord`]: 32 + 32 + 32 + 32 + 8.
-const SENT_RECORD_LEN: usize = 32 + 32 + 32 + 32 + 8;
+/// Borsh size of a [`SentRecord`]: 32 + 32 + 32 + 32 + 8 + 8.
+const SENT_RECORD_LEN: usize = 32 + 32 + 32 + 32 + 8 + 8;
 
 /// Load the `["sent", submissionId]` record, refusing any account that is not the
 /// canonical program-owned PDA. Mirrors [`load_config`]'s posture: a forged record
@@ -381,8 +532,22 @@ fn load_sent_record(
         // Never sent from this gate (or already refunded and closed).
         return Err(GateError::NotSent.into());
     }
-    SentRecord::deserialize(&mut &sent_ai.data.borrow()[..])
-        .map_err(|_| ProgramError::InvalidAccountData)
+    decode_sent_record(&sent_ai.data.borrow())
+}
+
+/// Decode a `SentRecord`, accepting the pre-round-4 layout (no `locked_at`).
+///
+/// Records written before `locked_at` existed are 8 bytes shorter. They are
+/// still valid origin proofs — the lock happened — so a refund of an in-flight
+/// transfer must not fail across the upgrade. Their lock time is unknown, so it
+/// reads as 0, which every age check treats as "cannot be shown aged".
+fn decode_sent_record(data: &[u8]) -> Result<SentRecord, ProgramError> {
+    if data.len() == SENT_RECORD_LEN - 8 {
+        let mut padded = data.to_vec();
+        padded.extend_from_slice(&[0u8; 8]);
+        return SentRecord::deserialize(&mut &padded[..]).map_err(|_| ProgramError::InvalidAccountData);
+    }
+    SentRecord::deserialize(&mut &data[..]).map_err(|_| ProgramError::InvalidAccountData)
 }
 
 /// Load the canonical asset binding for `debridge_id`, refusing any account that
@@ -518,13 +683,55 @@ fn is_already_executed(owner: &Pubkey, data_len: usize, program_id: &Pubkey) -> 
     owner == program_id && data_len > 0
 }
 
-/// Create a program-owned marker PDA at `seeds`, tolerating an account a griefer
-/// has pre-funded.
+/// Create a program-owned PDA of `space` bytes at `seeds`, tolerating an account
+/// a griefer has pre-funded.
 ///
 /// `system_instruction::create_account` fails outright when the target already
-/// holds lamports, which is the other half of H-2. `transfer` + `allocate` +
+/// holds lamports — that was the other half of H-2 for the executed marker, and
+/// audit round 4 (M-5) found the same brick still live in `init` and
+/// `register_asset`, whose addresses are equally derivable in advance
+/// (`["config"]` is fixed; a `debridge_id` is public). `transfer` + `allocate` +
 /// `assign` is the standard workaround: it tops the balance up to rent exemption
-/// (rather than requiring it to start at zero), then takes ownership.
+/// rather than requiring it to start at zero, then takes ownership.
+///
+/// EVERY PDA this program creates goes through here, so there is one copy of the
+/// sequence to get right rather than one per account type.
+fn create_pda_account<'a>(
+    program_id: &Pubkey,
+    payer: &AccountInfo<'a>,
+    target: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    seeds: &[&[u8]],
+    bump: u8,
+    space: usize,
+) -> ProgramResult {
+    let rent = Rent::get()?.minimum_balance(space);
+    let have = target.lamports();
+    if have < rent {
+        invoke(
+            &system_instruction::transfer(payer.key, target.key, rent - have),
+            &[payer.clone(), target.clone(), system_program.clone()],
+        )?;
+    }
+    // Seeds + bump, as `invoke_signed` wants them.
+    let bump_slice = [bump];
+    let mut signer_seeds: Vec<&[u8]> = seeds.to_vec();
+    signer_seeds.push(&bump_slice);
+
+    invoke_signed(
+        &system_instruction::allocate(target.key, space as u64),
+        &[target.clone(), system_program.clone()],
+        &[&signer_seeds],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(target.key, program_id),
+        &[target.clone(), system_program.clone()],
+        &[&signer_seeds],
+    )?;
+    Ok(())
+}
+
+/// Create a program-owned marker PDA at `seeds` (see [`create_pda_account`]).
 fn create_marker<'a>(
     program_id: &Pubkey,
     payer: &AccountInfo<'a>,
@@ -534,29 +741,7 @@ fn create_marker<'a>(
     bump: u8,
     state: u8,
 ) -> ProgramResult {
-    let rent = Rent::get()?.minimum_balance(MARKER_LEN);
-    let have = marker.lamports();
-    if have < rent {
-        invoke(
-            &system_instruction::transfer(payer.key, marker.key, rent - have),
-            &[payer.clone(), marker.clone(), system_program.clone()],
-        )?;
-    }
-    // Seeds + bump, as `invoke_signed` wants them.
-    let bump_slice = [bump];
-    let mut signer_seeds: Vec<&[u8]> = seeds.to_vec();
-    signer_seeds.push(&bump_slice);
-
-    invoke_signed(
-        &system_instruction::allocate(marker.key, MARKER_LEN as u64),
-        &[marker.clone(), system_program.clone()],
-        &[&signer_seeds],
-    )?;
-    invoke_signed(
-        &system_instruction::assign(marker.key, program_id),
-        &[marker.clone(), system_program.clone()],
-        &[&signer_seeds],
-    )?;
+    create_pda_account(program_id, payer, marker, system_program, seeds, bump, MARKER_LEN)?;
     // Non-zero so `data_is_empty()` reads false even if a future reader forgets
     // the owner half of the predicate, and it records WHICH terminal state was
     // reached (claimed vs cancelled).
@@ -584,25 +769,14 @@ fn create_sent_record<'a>(
         // per-corridor nonce, so treat it as a replay rather than overwrite it.
         return Err(GateError::AlreadyExecuted.into());
     }
-    let rent = Rent::get()?.minimum_balance(SENT_RECORD_LEN);
-    let have = sent.lamports();
-    if have < rent {
-        invoke(
-            &system_instruction::transfer(payer.key, sent.key, rent - have),
-            &[payer.clone(), sent.clone(), system_program.clone()],
-        )?;
-    }
-    let bump_slice = [bump];
-    let signer_seeds: &[&[u8]] = &[b"sent", id, &bump_slice];
-    invoke_signed(
-        &system_instruction::allocate(sent.key, SENT_RECORD_LEN as u64),
-        &[sent.clone(), system_program.clone()],
-        &[signer_seeds],
-    )?;
-    invoke_signed(
-        &system_instruction::assign(sent.key, program_id),
-        &[sent.clone(), system_program.clone()],
-        &[signer_seeds],
+    create_pda_account(
+        program_id,
+        payer,
+        sent,
+        system_program,
+        &[b"sent", id],
+        bump,
+        SENT_RECORD_LEN,
     )?;
     record.serialize(&mut &mut sent.data.borrow_mut()[..])?;
     Ok(())
@@ -785,6 +959,48 @@ pub enum GateError {
     /// the numeric code.
     #[error("bridge_domain must be non-zero")]
     ZeroBridgeDomain,
+    /// H-2 (round 4): a power-granting governance action was attempted with no
+    /// schedule for it (or one already consumed/cancelled). `Custom(17)`.
+    #[error("governance action not scheduled")]
+    GovernanceNotScheduled,
+    /// H-2 (round 4): scheduled, but GOVERNANCE_DELAY has not elapsed. `Custom(18)`.
+    #[error("governance action not ready — the 48h delay has not elapsed")]
+    GovernanceNotReady,
+    /// H-2 (round 4): matured more than GOVERNANCE_GRACE ago; re-schedule. `Custom(19)`.
+    #[error("governance schedule expired — re-schedule it")]
+    GovernanceExpired,
+    /// LOW (round 4): `init` was given the same validator twice. `Custom(20)`.
+    #[error("duplicate validator in the initial set")]
+    DuplicateValidator,
+    /// LOW (round 4): `init` or `set_validator` was given the zero address.
+    /// `Custom(21)`. Mirrors `Gate.sol`'s `ZeroValidator`.
+    #[error("validator address must be non-zero")]
+    ZeroValidator,
+}
+
+/// Pure init-time validator-set rule (host-testable; `init` itself cannot run
+/// under `solana-program-test`, see `tests/account_level.rs`).
+///
+/// Duplicates are refused because `verify_threshold` counts each recovered
+/// signer once — a set of `[A, A, B]` with threshold 3 is unreachable and
+/// freezes the gate, while `[A, A]` with threshold 2 would let ONE key look like
+/// two if a later refactor ever counted by index. The zero address is refused
+/// because `verify_threshold` seeds its ordering check at `0x00…00`, so a "zero
+/// validator" could never sign anyway — registering one only inflates the count
+/// the threshold is checked against. `Gate.sol` refuses both.
+fn validate_validator_set(validators: &[[u8; 20]], threshold: u32) -> Result<(), ProgramError> {
+    if threshold == 0 || threshold > validators.len() as u32 {
+        return Err(ProgramError::InvalidArgument);
+    }
+    for (i, v) in validators.iter().enumerate() {
+        if v == &[0u8; 20] {
+            return Err(GateError::ZeroValidator.into());
+        }
+        if validators[..i].contains(v) {
+            return Err(GateError::DuplicateValidator.into());
+        }
+    }
+    Ok(())
 }
 
 impl From<GateError> for ProgramError {
@@ -966,7 +1182,102 @@ pub fn process_instruction(
         }
         GateInstruction::Cancel(args) => process_cancel(program_id, accounts, args),
         GateInstruction::Refund(args) => process_refund(program_id, accounts, args),
+        GateInstruction::ScheduleGovernance { action_id } => {
+            process_schedule_governance(program_id, accounts, action_id)
+        }
+        GateInstruction::CancelScheduledGovernance { action_id } => {
+            process_cancel_scheduled_governance(program_id, accounts, action_id)
+        }
     }
+}
+
+/// Accounts: [config, owner(s,w), gov_pda(w), system_program]
+///
+/// H-2 (round 4): queue a validator addition or threshold decrease. Re-scheduling
+/// RESTARTS the delay rather than keeping the earliest deadline, for the reason
+/// `Gate.scheduleGovernance` gives: otherwise one matured schedule would be an
+/// indefinitely re-usable instant-change right against that action.
+///
+/// The schedule lives in its own PDA rather than in `Config` so the config
+/// account — sized once at init and unable to grow (H-3) — never has to hold an
+/// unbounded map. Created through [`create_pda_account`], so pre-funding the
+/// address cannot block governance (M-5).
+fn process_schedule_governance(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    action_id: [u8; 32],
+) -> ProgramResult {
+    let it = &mut accounts.iter();
+    let config_ai = next_account_info(it)?;
+    let owner = next_account_info(it)?;
+    let gov_ai = next_account_info(it)?;
+    let system_program = next_account_info(it)?;
+
+    let cfg = load_config(program_id, config_ai)?;
+    if owner.key != &cfg.owner || !owner.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let (expected, bump) = Pubkey::find_program_address(&[b"gov", &action_id], program_id);
+    if gov_ai.key != &expected {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if !(gov_ai.owner == program_id && gov_ai.data_len() >= GOVERNANCE_LEN) {
+        // First schedule for this action (or a squatter's pre-funded account).
+        if !gov_ai.data_is_empty() && gov_ai.owner != program_id {
+            return Err(ProgramError::IllegalOwner);
+        }
+        create_pda_account(
+            program_id,
+            owner,
+            gov_ai,
+            system_program,
+            &[b"gov", &action_id],
+            bump,
+            GOVERNANCE_LEN,
+        )?;
+    }
+    let now = solana_program::clock::Clock::get()?.unix_timestamp;
+    let ready_at = now.checked_add(GOVERNANCE_DELAY).ok_or(ProgramError::ArithmeticOverflow)?;
+    GovernanceSchedule { ready_at }.serialize(&mut &mut gov_ai.data.borrow_mut()[..])?;
+    msg!("governance scheduled: ready_at {}", ready_at);
+    Ok(())
+}
+
+/// Accounts: [config, signer(s), gov_pda(w)]
+///
+/// H-2 (round 4): drop a queued action. Owner OR guardian — the guardian is the
+/// low-trust stop button, and cancelling a pending grant of power is exactly the
+/// kind of incident response it exists for. Nothing is executed here, so the
+/// worst a compromised guardian can do is delay a legitimate change.
+fn process_cancel_scheduled_governance(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    action_id: [u8; 32],
+) -> ProgramResult {
+    let it = &mut accounts.iter();
+    let config_ai = next_account_info(it)?;
+    let who = next_account_info(it)?;
+    let gov_ai = next_account_info(it)?;
+
+    let cfg = load_config(program_id, config_ai)?;
+    if !who.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let is_owner = who.key == &cfg.owner;
+    let is_guardian = cfg.guardian != Pubkey::default() && who.key == &cfg.guardian;
+    if !(is_owner || is_guardian) {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    let (expected, _bump) = Pubkey::find_program_address(&[b"gov", &action_id], program_id);
+    if gov_ai.key != &expected {
+        return Err(ProgramError::InvalidSeeds);
+    }
+    if gov_ai.owner != program_id || gov_ai.data_len() < GOVERNANCE_LEN {
+        return Ok(()); // nothing scheduled; idempotent like `delete` on a mapping
+    }
+    GovernanceSchedule::default().serialize(&mut &mut gov_ai.data.borrow_mut()[..])?;
+    msg!("governance schedule cancelled");
+    Ok(())
 }
 
 /// Accounts: [config, executed_pda(w), payer(s,w), system_program]
@@ -1174,9 +1485,8 @@ fn process_init(program_id: &Pubkey, accounts: &[AccountInfo], args: InitArgs) -
     if !config_ai.data_is_empty() {
         return Err(ProgramError::AccountAlreadyInitialized);
     }
-    if args.threshold == 0 || args.threshold > args.validators.len() as u32 {
-        return Err(ProgramError::InvalidArgument);
-    }
+    // LOW (round 4): threshold in range, no duplicates, no zero address.
+    validate_validator_set(&args.validators, args.threshold)?;
     // Capacities must cover the initial set and be non-zero, or the gate is born
     // unable to register the corridor it needs to send anything.
     if args.max_validators < args.validators.len() as u32 || args.max_corridors == 0 {
@@ -1191,12 +1501,20 @@ fn process_init(program_id: &Pubkey, accounts: &[AccountInfo], args: InitArgs) -
     // Size the account from the DECLARED capacities rather than a flat 512 bytes
     // (H-3 / L-3). Both vectors are capped at these, so the config can never grow
     // past the buffer and wedge every instruction that reserializes it.
+    //
+    // M-5 (round 4): `["config"]` is a fixed, public address, so anyone can park
+    // a lamport there before the deployer runs `init` — and `create_account`
+    // would then fail with "already in use" forever, forcing a redeploy under a
+    // new program id. The shared transfer+allocate+assign path tolerates it.
     let space = config_space(args.max_validators, args.max_corridors);
-    let rent = Rent::get()?.minimum_balance(space);
-    invoke_signed(
-        &system_instruction::create_account(payer.key, config_ai.key, rent, space as u64, program_id),
-        &[payer.clone(), config_ai.clone(), system_program.clone()],
-        &[&[b"config", &[bump]]],
+    create_pda_account(
+        program_id,
+        payer,
+        config_ai,
+        system_program,
+        &[b"config"],
+        bump,
+        space,
     )?;
 
     // A zero domain is refused for the same reason the EVM gate refuses it: it is
@@ -1413,6 +1731,8 @@ fn process_send(program_id: &Pubkey, accounts: &[AccountInfo], args: SendArgs) -
             source_token: *user_token.key,
             mint: asset.mint,
             amount: args.amount,
+            // M-4 / M-13: the on-chain age proof a refund attester reads.
+            locked_at: solana_program::clock::Clock::get()?.unix_timestamp,
         },
     )?;
 
@@ -1543,6 +1863,14 @@ fn process_claim(program_id: &Pubkey, accounts: &[AccountInfo], args: ClaimArgs)
     Ok(())
 }
 
+/// Accounts: [config(w), owner(s), gov_pda(w)?]
+///
+/// H-2 (round 4): ASYMMETRIC BY DESIGN, exactly as `Gate.setValidator`. ADDING a
+/// validator hands out signing power and must consume a matured
+/// `["gov", add_validator_action_id(v)]` schedule; REMOVING one takes power away
+/// and is immediate — the moment a key is known compromised is the moment it
+/// must leave the set. The third account is only required for an addition, so
+/// removals keep the two-account shape existing tooling sends.
 fn process_set_validator(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -1557,23 +1885,39 @@ fn process_set_validator(
     if owner.key != &cfg.owner || !owner.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
+    if validator == [0u8; 20] {
+        return Err(GateError::ZeroValidator.into());
+    }
     let present = cfg.is_validator(&validator);
     if active && !present {
         // L-3: the account was sized for `max_validators` at init and cannot grow.
         if cfg.validators.len() as u32 >= cfg.max_validators {
             return Err(GateError::AtCapacity.into());
         }
+        // The power-granting direction waits out the timelock.
+        let gov_ai = next_account_info(it)
+            .map_err(|_| ProgramError::from(GateError::GovernanceNotScheduled))?;
+        consume_governance(program_id, gov_ai, &add_validator_action_id(&validator))?;
         cfg.validators.push(validator);
     } else if !active && present {
         cfg.validators.retain(|v| v != &validator);
         if (cfg.validators.len() as u32) < cfg.threshold {
             return Err(ProgramError::InvalidArgument);
         }
+    } else {
+        return Ok(()); // no-op: no state change
     }
     cfg.store(config_ai)?;
     Ok(())
 }
 
+/// Accounts: [config(w), owner(s), gov_pda(w)?]
+///
+/// H-2 (round 4): same asymmetry as [`process_set_validator`]. RAISING the
+/// threshold makes the gate harder to move and takes effect at once; LOWERING it
+/// is the other half of the owner-drain path and must consume a matured
+/// `["gov", lower_threshold_action_id(t)]` schedule. The schedule commits to the
+/// exact value, so an approval for `t = 2` cannot be spent on `t = 1`.
 fn process_set_threshold(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -1589,6 +1933,11 @@ fn process_set_threshold(
     }
     if threshold == 0 || threshold > cfg.validators.len() as u32 {
         return Err(ProgramError::InvalidArgument);
+    }
+    if threshold < cfg.threshold {
+        let gov_ai = next_account_info(it)
+            .map_err(|_| ProgramError::from(GateError::GovernanceNotScheduled))?;
+        consume_governance(program_id, gov_ai, &lower_threshold_action_id(threshold))?;
     }
     cfg.threshold = threshold;
     cfg.store(config_ai)?;
@@ -1666,17 +2015,19 @@ fn process_register_asset(
     let record = AssetConfig { debridge_id, mint: *mint.key, vault: *vault.key };
     let space: usize = 1 + 32 + 32 + 32; // borsh: debridge_id + mint + vault (+slack)
     if asset_ai.data_is_empty() {
-        let rent = Rent::get()?.minimum_balance(space);
-        invoke_signed(
-            &system_instruction::create_account(
-                owner.key,
-                asset_ai.key,
-                rent,
-                space as u64,
-                program_id,
-            ),
-            &[owner.clone(), asset_ai.clone(), system_program.clone()],
-            &[&[b"asset", &debridge_id, &[bump]]],
+        // M-5 (round 4): a `debridge_id` is public in advance, so an attacker
+        // could pre-fund every plausible asset PDA and `create_account` would
+        // refuse each one as "already in use" — bricking registration until the
+        // program was redeployed. Same pre-funding-tolerant path as every other
+        // PDA this program creates.
+        create_pda_account(
+            program_id,
+            owner,
+            asset_ai,
+            system_program,
+            &[b"asset", &debridge_id],
+            bump,
+            space,
         )?;
     } else if asset_ai.owner != program_id {
         return Err(ProgramError::IllegalOwner);
@@ -2315,6 +2666,13 @@ mod c1_tests {
             GateError::AlreadyClaimed,
             GateError::NotCancelled,
             GateError::TooManySignatures,
+            GateError::AssetAlreadyRegistered,
+            GateError::ZeroBridgeDomain,
+            GateError::GovernanceNotScheduled,
+            GateError::GovernanceNotReady,
+            GateError::GovernanceExpired,
+            GateError::DuplicateValidator,
+            GateError::ZeroValidator,
         ] {
             assert_ne!(receiver, ProgramError::from(other), "collides with {other:?}");
         }
@@ -2347,6 +2705,117 @@ mod c1_tests {
         // New variants land after every pre-existing one, in order.
         assert_eq!(ProgramError::from(GateError::TooManySignatures), ProgramError::Custom(13));
         assert_eq!(ProgramError::from(GateError::ReceiverNotTokenAccount), ProgramError::Custom(14));
+        assert_eq!(ProgramError::from(GateError::AssetAlreadyRegistered), ProgramError::Custom(15));
+        assert_eq!(ProgramError::from(GateError::ZeroBridgeDomain), ProgramError::Custom(16));
+        // Round 4 additions, appended in order.
+        assert_eq!(ProgramError::from(GateError::GovernanceNotScheduled), ProgramError::Custom(17));
+        assert_eq!(ProgramError::from(GateError::GovernanceNotReady), ProgramError::Custom(18));
+        assert_eq!(ProgramError::from(GateError::GovernanceExpired), ProgramError::Custom(19));
+        assert_eq!(ProgramError::from(GateError::DuplicateValidator), ProgramError::Custom(20));
+        assert_eq!(ProgramError::from(GateError::ZeroValidator), ProgramError::Custom(21));
+    }
+
+    // ---------------------------------------------------------------
+    // H-2 (round 4) — the governance timelock rule
+    // ---------------------------------------------------------------
+
+    /// The consume rule, over cluster time. Not scheduled / immature / matured /
+    /// expired are four different answers and only ONE of them is "go".
+    #[test]
+    fn a_schedule_is_consumable_only_inside_its_window() {
+        let ready_at = 1_000_000i64;
+        // Never scheduled (or already consumed/cancelled): the zero sentinel.
+        assert_eq!(governance_consumable(0, ready_at + 1), Err(GateError::GovernanceNotScheduled));
+        // Immature: one second early is still early.
+        assert_eq!(governance_consumable(ready_at, ready_at - 1), Err(GateError::GovernanceNotReady));
+        // Exactly at ready_at, and anywhere inside the grace window: consumable.
+        assert_eq!(governance_consumable(ready_at, ready_at), Ok(()));
+        assert_eq!(governance_consumable(ready_at, ready_at + GOVERNANCE_GRACE), Ok(()));
+        // One second past the grace window: a stale approval, refused.
+        assert_eq!(
+            governance_consumable(ready_at, ready_at + GOVERNANCE_GRACE + 1),
+            Err(GateError::GovernanceExpired)
+        );
+    }
+
+    /// The delay is the EVM gate's 48 hours and the grace is a week — pinned so
+    /// nobody quietly shortens the window the whole mesh's users plan around.
+    #[test]
+    fn governance_delay_and_grace_match_the_design() {
+        assert_eq!(GOVERNANCE_DELAY, 48 * 3600, "must equal Gate.sol GOVERNANCE_DELAY");
+        assert_eq!(GOVERNANCE_GRACE, 7 * 86_400);
+        assert!(GOVERNANCE_GRACE > 0, "a zero grace would make every schedule expire on arrival");
+    }
+
+    /// A schedule commits to ONE concrete change. Different validators, different
+    /// thresholds, and the two kinds of action all derive distinct ids, so an
+    /// approval for one can never be spent on another.
+    #[test]
+    fn action_ids_are_specific_to_the_exact_change() {
+        let a = add_validator_action_id(&[0xAA; 20]);
+        let b = add_validator_action_id(&[0xBB; 20]);
+        assert_ne!(a, b, "approving validator A must not approve validator B");
+
+        let t1 = lower_threshold_action_id(1);
+        let t2 = lower_threshold_action_id(2);
+        assert_ne!(t1, t2, "an approval for t=2 must not be spendable on t=1");
+
+        // Cross-kind: the domain strings keep them apart even for overlapping bytes.
+        assert_ne!(add_validator_action_id(&[0u8; 20]), lower_threshold_action_id(0));
+        // Deterministic, so off-chain tooling can derive the same id.
+        assert_eq!(a, add_validator_action_id(&[0xAA; 20]));
+    }
+
+    /// A `["sent", id]` record written before `locked_at` existed must still
+    /// decode — it proves the lock — with an unknown (zero) lock time.
+    #[test]
+    fn a_legacy_sent_record_decodes_with_an_unknown_lock_time() {
+        let rec = SentRecord {
+            debridge_id: [1; 32],
+            sender: Pubkey::new_unique(),
+            source_token: Pubkey::new_unique(),
+            mint: Pubkey::new_unique(),
+            amount: 77,
+            locked_at: 1_700_000_000,
+        };
+        let full = borsh::to_vec(&rec).unwrap();
+        assert_eq!(full.len(), SENT_RECORD_LEN);
+        let legacy = &full[..SENT_RECORD_LEN - 8];
+
+        let decoded = decode_sent_record(legacy).expect("legacy layout decodes");
+        assert_eq!(decoded.amount, 77);
+        assert_eq!(decoded.source_token, rec.source_token);
+        assert_eq!(decoded.locked_at, 0, "unknown lock time reads as 0");
+
+        let current = decode_sent_record(&full).expect("current layout decodes");
+        assert_eq!(current.locked_at, 1_700_000_000);
+        assert!(decode_sent_record(&full[..100]).is_err(), "anything else is corrupt");
+    }
+
+    // ---------------------------------------------------------------
+    // LOW (round 4) — init validator-set validation
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn init_refuses_duplicate_and_zero_validators_and_a_bad_threshold() {
+        let a = [1u8; 20];
+        let b = [2u8; 20];
+        assert_eq!(validate_validator_set(&[a, b], 2), Ok(()));
+        assert_eq!(validate_validator_set(&[a, b], 1), Ok(()));
+
+        assert_eq!(
+            validate_validator_set(&[a, a], 2),
+            Err(GateError::DuplicateValidator.into()),
+            "the same key twice must not count as two validators"
+        );
+        assert_eq!(
+            validate_validator_set(&[a, [0u8; 20]], 1),
+            Err(GateError::ZeroValidator.into()),
+            "the zero address can never sign; registering it only inflates the count"
+        );
+        assert_eq!(validate_validator_set(&[a, b], 0), Err(ProgramError::InvalidArgument));
+        assert_eq!(validate_validator_set(&[a, b], 3), Err(ProgramError::InvalidArgument));
+        assert_eq!(validate_validator_set(&[], 1), Err(ProgramError::InvalidArgument));
     }
 
     // Atomic/authorized init: only the program's upgrade authority (deployer) may

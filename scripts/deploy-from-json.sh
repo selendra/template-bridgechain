@@ -2,6 +2,7 @@
 # deploy-from-json.sh — deploy the bridge contracts from a JSON config.
 #
 #   bash scripts/deploy-from-json.sh [config.json] [--dry-run] [--no-config-update] [--redeploy]
+#                                    [--allow-local-profile-on-chain]
 #
 # Default config: config/deploy.config.json  (see config/README.md for the field
 # reference). Two profiles:
@@ -11,10 +12,20 @@
 #                 liquidity. The deployer stays the gate owner.
 #   "production"  runs contracts/script/DeployProd.s.sol, which enforces >=3
 #                 validators, a strict-majority threshold, a guardian, and hands
-#                 ownership to a multisig (two-step). No tokens are deployed and
-#                 NO corridor is registered here — after the handover only the
-#                 owner may call setLocalToken, so the script emits the calldata
-#                 for governance to execute instead.
+#                 ownership to a multisig (two-step). No tokens are deployed.
+#
+# The `local` profile is REFUSED on any chain id outside DEV_CHAIN_IDS below
+# (M-12: it ships threshold-1 gates owned by a hot key with no guardian) unless
+# --allow-local-profile-on-chain is passed explicitly.
+#
+# Gate wiring, both profiles, while the deployer is still the (transient) owner
+# — i.e. before the multisig's acceptOwnership():
+#   setSupportedChain(peer, true) for every peer -> setLocalToken for every
+#   inbound corridor -> seal()  (gate.seal, default true; irreversible).
+# Anything the deployer cannot send (a gate it no longer owns, a corridor on an
+# already-sealed gate) is written to `governance_calls` in the output file for
+# the owner to execute — including the scheduleGovernance step a sealed gate
+# needs first. Production asserts isSealed and every supportedChain at the end.
 #
 # Writes every address it produced to `output.file`, and (unless
 # --no-config-update) patches gate/token/pool addresses straight into the
@@ -27,12 +38,24 @@ CONFIG="config/deploy.config.json"
 DRY_RUN=false
 UPDATE_CFG=true
 REDEPLOY=false
+ALLOW_LOCAL_ON_CHAIN=false
+
+# Chain ids the `local` profile may touch (M-12). One list, one place: anvil /
+# hardhat defaults, the ports-as-chain-ids convention the launchers here use, and
+# the well-known public testnets. Anything else is presumed to carry real value.
+#   31337 anvil/hardhat, 1337-1339 run.config, 11155111 Sepolia, 560048 Hoodi,
+#   17000 Holesky, 84532 Base Sepolia, 421614 Arbitrum Sepolia, 11155420 OP
+#   Sepolia, 80002 Polygon Amoy, 97 BSC testnet, 43113 Fuji, 1313161555 Aurora
+#   testnet, 1953 Selendra testnet
+DEV_CHAIN_IDS=(31337 31338 31339 1337 1338 1339 11155111 560048 17000 84532 421614 11155420 80002 97 43113 1313161555 1953)
+is_dev_chain() { local c; for c in "${DEV_CHAIN_IDS[@]}"; do [[ "$1" == "$c" ]] && return 0; done; return 1; }
 
 for arg in "$@"; do
   case "$arg" in
     --dry-run)          DRY_RUN=true ;;
     --redeploy)         REDEPLOY=true ;;
     --no-config-update) UPDATE_CFG=false ;;
+    --allow-local-profile-on-chain) ALLOW_LOCAL_ON_CHAIN=true ;;
     -h|--help)          sed -n '2,25p' "$0"; exit 0 ;;
     -*)                 echo "unknown flag: $arg" >&2; exit 1 ;;
     *)                  CONFIG="$arg" ;;
@@ -77,7 +100,10 @@ dupes="$(printf '%s\n' "${VALIDATORS[@]}" | tr 'A-F' 'a-f' | sort | uniq -d)"
 [[ -z "$dupes" ]] || die "duplicate validator address: $dupes"
 
 # --- profile policy --------------------------------------------------------
+SEAL="$(j 'if .gate.seal == null then true else .gate.seal end')"
+mapfile -t EXTRA_PEERS < <(j '.gate.extra_supported_chains[]?')
 if [[ "$PROFILE" == "production" ]]; then
+  [[ "$SEAL" == "true" ]] || die "production must seal the gates (gate.seal = false is a dev-only setting)"
   (( ${#VALIDATORS[@]} >= 3 )) || die "production needs >= 3 validators (DeployProd rejects fewer)"
   (( THRESHOLD >= 2 && THRESHOLD * 2 > ${#VALIDATORS[@]} )) || die "production needs a strict-majority threshold (> ${#VALIDATORS[@]}/2, and >= 2)"
   [[ "$GUARDIAN" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "production needs gate.guardian"
@@ -127,6 +153,16 @@ fi
 
 mapfile -t CHAIN_IDS < <(j '.chains[] | select(.enabled != false) | .chain_id')
 (( ${#CHAIN_IDS[@]} >= 1 )) || die "no enabled chains in .chains"
+if [[ "$PROFILE" == "local" ]]; then
+  # A local-profile gate is a threshold-1 (possibly) gate owned by the deployer's
+  # hot key with no guardian. On a chain with real value that is a live bridge
+  # one leaked key away from empty — and Gen-5 WAS deployed this way (M-12).
+  for cid in "${CHAIN_IDS[@]}"; do
+    is_dev_chain "$cid" && continue
+    $ALLOW_LOCAL_ON_CHAIN || die "profile \"local\" on chain $cid, which is not in DEV_CHAIN_IDS (${DEV_CHAIN_IDS[*]}). Use profile \"production\" (guardian, multisig owner, strict-majority quorum), or pass --allow-local-profile-on-chain if you really mean to run a hot-key gate there."
+    warn "profile \"local\" on non-dev chain $cid — allowed by --allow-local-profile-on-chain; the gate owner will be the deployer hot key"
+  done
+fi
 # `join` on numbers is a jq type error, and an `&&` tail here would be the
 # script's exit status under `set -e` when nothing is skipped.
 skipped="$(j '[.chains[] | select(.enabled == false) | .chain_id | tostring] | join(", ")')"
@@ -258,8 +294,67 @@ if (( ${#SYMS[@]} )); then
   done
 fi
 
-# --- corridors: setLocalToken (write-once, owner-only) ----------------------
+# --- gate wiring (audit round 4: M-3 supportedChain, H-1 seal) --------------
+#
+# The deployer is the gate's owner until the multisig calls acceptOwnership()
+# (two-step), so the wiring below is sent directly in BOTH profiles. What the
+# deployer cannot send — a gate someone else already owns, a corridor on a gate
+# that is already sealed — becomes a `governance_calls` entry for the owner.
 CORRIDOR_CALLS='[]'
+gate_owner()       { cast call "$1" 'owner()(address)' --rpc-url "$2" 2>/dev/null || echo ""; }
+gate_owned_by_us() { [[ "$(gate_owner "$1" "$2" | tr 'A-F' 'a-f')" == "${DEPLOYER_ADDR,,}" ]]; }
+gate_sealed()      { [[ "$(cast call "$1" 'isSealed()(bool)' --rpc-url "$2" 2>/dev/null || echo false)" == "true" ]]; }
+chain_supported()  { [[ "$(cast call "$1" 'supportedChain(uint256)(bool)' "$3" --rpc-url "$2" 2>/dev/null || echo false)" == "true" ]]; }
+gov_call() {  # chain_id to data note
+  CORRIDOR_CALLS="$(jq -c --argjson c "$1" --arg to "$2" --arg d "$3" --arg n "$4" \
+    '. + [{chain_id: $c, to: $to, data: $d, note: $n}]' <<<"$CORRIDOR_CALLS")"
+}
+peers_of() {  # chain_id -> every chain id its gate may `send` to
+  local me="$1" c
+  for c in "${CHAIN_IDS[@]}"; do [[ "$c" == "$me" ]] || echo "$c"; done
+  [[ "$(j '.solana.enabled // false')" == "true" ]] && j '.solana.chain_id'
+  for c in "${EXTRA_PEERS[@]:-}"; do [[ -n "$c" ]] && echo "$c"; done
+}
+# setLocalToken is WRITE-ONCE (in-flight claims bind only the debridgeId, so
+# repointing a live corridor would release the wrong asset): an existing mapping
+# is left alone. On a SEALED gate a new corridor needs scheduleGovernance first,
+# so both calls are emitted for the owner, in order.
+register_corridor() {  # chain_id debridgeId localToken note
+  local cid="$1" did="$2" tok="$3" note="$4" cur data aid
+  cur="$(cast call "${GATE[$cid]}" 'tokenOf(bytes32)(address)' "$did" --rpc-url "${RPC[$cid]}" 2>/dev/null || echo "")"
+  if [[ -n "$cur" && ! "$cur" =~ ^0x0{40}$ ]]; then info "chain $cid: $note already registered ($cur)"; return; fi
+  data="$(cast calldata 'setLocalToken(bytes32,address)' "$did" "$tok")"
+  if gate_owned_by_us "${GATE[$cid]}" "${RPC[$cid]}" && ! gate_sealed "${GATE[$cid]}" "${RPC[$cid]}"; then
+    csend "${GATE[$cid]}" 'setLocalToken(bytes32,address)' "$did" "$tok" --rpc-url "${RPC[$cid]}"
+    info "chain $cid: $note  ($did)"
+  else
+    if gate_sealed "${GATE[$cid]}" "${RPC[$cid]}"; then
+      aid="$(cast call "${GATE[$cid]}" 'setLocalTokenActionId(bytes32,address)(bytes32)' "$did" "$tok" --rpc-url "${RPC[$cid]}")"
+      gov_call "$cid" "${GATE[$cid]}" "$(cast calldata 'scheduleGovernance(bytes32)' "$aid")" "1/2 schedule: $note (sealed gate; wait GOVERNANCE_DELAY, then 2/2 within SCHEDULE_GRACE)"
+      gov_call "$cid" "${GATE[$cid]}" "$data" "2/2 $note"
+    else
+      gov_call "$cid" "${GATE[$cid]}" "$data" "$note"
+    fi
+    warn "chain $cid: $note NOT sent (owner $(gate_owner "${GATE[$cid]}" "${RPC[$cid]}"), sealed=$(gate_sealed "${GATE[$cid]}" "${RPC[$cid]}" && echo true || echo false)) — written to governance_calls"
+  fi
+}
+
+say "listing destinations (setSupportedChain)"
+for cid in "${CHAIN_IDS[@]}"; do
+  for peer in $(peers_of "$cid"); do
+    chain_supported "${GATE[$cid]}" "${RPC[$cid]}" "$peer" && continue
+    data="$(cast calldata 'setSupportedChain(uint256,bool)' "$peer" true)"
+    if gate_owned_by_us "${GATE[$cid]}" "${RPC[$cid]}"; then
+      csend "${GATE[$cid]}" 'setSupportedChain(uint256,bool)' "$peer" true --rpc-url "${RPC[$cid]}"
+      info "chain $cid: send -> $peer enabled"
+    else
+      gov_call "$cid" "${GATE[$cid]}" "$data" "setSupportedChain($peer, true)"
+      warn "chain $cid: not the gate owner — setSupportedChain($peer) written to governance_calls"
+    fi
+  done
+done
+
+# --- corridors: setLocalToken (write-once, owner-only) ----------------------
 for sym in "${SYMS[@]:-}"; do
   [[ -z "${sym:-}" ]] && continue
   [[ "$(j ".assets[] | select(.symbol == \"$sym\") | .register_corridors")" == "true" ]] || continue
@@ -270,30 +365,10 @@ for sym in "${SYMS[@]:-}"; do
     for ocid in "${chs[@]}"; do
       [[ "$ocid" == "$cid" ]] && continue
       did="$(debridge_id "$ocid" "${TOKEN[$sym|$ocid]}")"
-      local_tok="${TOKEN[$sym|$cid]}"
-      if [[ "$PROFILE" == "production" ]]; then
-        # Ownership is (pending) with the multisig, so only governance can do this.
-        data="$(cast calldata 'setLocalToken(bytes32,address)' "$did" "$local_tok")"
-        CORRIDOR_CALLS="$(jq -c --arg c "$cid" --arg to "${GATE[$cid]}" --arg d "$data" \
-          --arg sym "$sym" --arg from "$ocid" \
-          '. + [{chain_id: ($c|tonumber), to: $to, data: $d, note: ("register \($sym) inbound from chain \($from)")}]' <<<"$CORRIDOR_CALLS")"
-        continue
-      fi
-      cur="$(cast call "${GATE[$cid]}" 'tokenOf(bytes32)(address)' "$did" --rpc-url "${RPC[$cid]}" 2>/dev/null || echo "")"
-      if [[ -z "$cur" || "$cur" =~ ^0x0{40}$ ]]; then
-        csend "${GATE[$cid]}" 'setLocalToken(bytes32,address)' "$did" "$local_tok" --rpc-url "${RPC[$cid]}"
-        info "chain $cid <- $sym from chain $ocid  ($did)"
-      else
-        # setLocalToken is WRITE-ONCE: in-flight claims bind only the debridgeId,
-        # so repointing a live corridor would release the wrong asset.
-        info "chain $cid <- $sym from chain $ocid already registered ($cur)"
-      fi
+      register_corridor "$cid" "$did" "${TOKEN[$sym|$cid]}" "register $sym inbound from chain $ocid"
     done
   done
 done
-if [[ "$PROFILE" == "production" && "$CORRIDOR_CALLS" != "[]" ]]; then
-  warn "corridors NOT registered: the gate owner is the multisig. Execute output.governance_calls after acceptOwnership()."
-fi
 
 # --- test liquidity (local only) -------------------------------------------
 for sym in "${SYMS[@]:-}"; do
@@ -487,16 +562,32 @@ if [[ "$(j '.solana.enabled // false')" == "true" ]]; then
     sleep 2
   done
 
+  # --- production policy for the Solana leg (M-12) ---------------------------
+  #
+  # `init` must be signed by the program's UPGRADE AUTHORITY, and the signer
+  # becomes the gate owner FOR GOOD: there is no ownership-transfer instruction
+  # on this side (unlike the EVM gate's two-step handover). Owner actions that
+  # widen trust — `set-validator` (add), `set-threshold` (lower) — now sit behind
+  # a 48h `schedule-governance` (H-2), but the owner key itself is whatever paid
+  # for `init`. So production requires that key to be NAMED in the config as the
+  # multisig-controlled owner (`solana.init.owner`), to MATCH the payer, and to
+  # come with a guardian; anything else is a hot-key gate and is refused.
+  guardian="$(jr '.solana.init.guardian')"
+  SOL_OWNER="$(jr '.solana.init.owner')"
+  if [[ "$PROFILE" == "production" ]]; then
+    [[ -n "$guardian" ]]  || die "production needs solana.init.guardian — the Solana gate's stop button (pause-only, may be hot)"
+    [[ -n "$SOL_OWNER" ]] || die "production needs solana.init.owner: the multisig-controlled key that will own the Solana gate. It MUST be the key in solana.payer_keypair — the init signer is the owner and cannot be changed later"
+    [[ "$SOL_OWNER" == "$PAYER_PUBKEY" ]] || die "solana.init.owner ($SOL_OWNER) is not the payer ($PAYER_PUBKEY). The Solana gate has no ownership transfer: whoever signs init owns it. Point solana.payer_keypair at the multisig-controlled key, or hold the deploy"
+    [[ "$guardian" != "$SOL_OWNER" ]] || die "solana.init.guardian must differ from solana.init.owner"
+  elif [[ -z "$SOL_OWNER" ]]; then
+    warn "solana.init.owner unset: the Solana gate owner will be the deploy payer $PAYER_PUBKEY (fine on devnet; production refuses this)"
+  fi
+
   # --- init (idempotent: the program refuses a second init, so read first) ---
   show="$(ga show 2>&1)" || { echo "$show"; die "gate-admin show failed"; }
   if grep -q "NOT INITIALIZED" <<<"$show"; then
     [[ "$(j '.solana.init.run')" == "true" ]] || die "the gate program is not initialized and solana.init.run = false"
     vargs=(); for v in "${VALIDATORS[@]}"; do vargs+=(--validator "$v"); done
-    guardian="$(jr '.solana.init.guardian')"
-    # `init` must be signed by the program's UPGRADE AUTHORITY, and the signer
-    # becomes the gate owner. There is no ownership-transfer instruction on this
-    # side — unlike the EVM gate's two-step handover — so whichever key deploys
-    # the program is the key that governs it. Guard it accordingly.
     ga_retry init --chain-id "$SOL_CHAIN_ID" --threshold "$THRESHOLD" "${vargs[@]}" \
        --bridge-domain "$BRIDGE_DOMAIN" \
        --max-validators "$(j '.solana.init.max_validators')" \
@@ -506,6 +597,27 @@ if [[ "$(j '.solana.enabled // false')" == "true" ]]; then
     show="$(ga show 2>&1)"
   else
     info "init    : already initialized (leaving it alone)"
+  fi
+
+  # Whoever `show` reports as owner is who governs this gate, for its lifetime.
+  # A program from an earlier run that some other key initialised is exactly the
+  # case this catches: nothing here can fix it, so say so before anything else
+  # is registered against it.
+  on_chain_owner="$(sed -n 's/^  owner *: *//p' <<<"$show" | head -1)"
+  if [[ -n "$SOL_OWNER" && -n "$on_chain_owner" && "$on_chain_owner" != "$SOL_OWNER" ]]; then
+    msg="the Solana gate's on-chain owner is $on_chain_owner, but solana.init.owner says $SOL_OWNER — there is no owner-transfer instruction, so that key governs validators/threshold (48h schedule) and pause (instant) for good"
+    if [[ "$PROFILE" == "production" ]]; then die "$msg. Deploy a fresh program with the right payer."; else warn "$msg"; fi
+  fi
+  # Post-deploy governance on this gate (validator add / threshold lower):
+  #   gate-admin schedule-governance <action-id>   # the id set-validator/set-threshold print
+  #   (wait GOVERNANCE_DELAY, 48h)  gate-admin set-validator … / set-threshold …
+  #   gate-admin governance-status | cancel-governance <action-id>   (guardian may cancel)
+  # And move the program's UPGRADE AUTHORITY behind the same multisig/timelock:
+  #   solana program set-upgrade-authority <program> --new-upgrade-authority <multisig>
+  if [[ "$PROFILE" == "production" ]]; then
+    upgrade_auth="$(solana program show "$SOL_PROGRAM" --url "$SOL_RPC" 2>/dev/null | sed -n 's/^Authority: *//p' | head -1)"
+    [[ -z "$upgrade_auth" || "$upgrade_auth" == "$PAYER_PUBKEY" ]] \
+      && warn "the program's upgrade authority is the deploy payer ($upgrade_auth). The program cannot delay its own upgrade: move it behind the multisig/timelock — solana program set-upgrade-authority $SOL_PROGRAM --new-upgrade-authority <multisig>"
   fi
 
   # An existing program from an EARLIER generation is the failure this catches:
@@ -560,18 +672,7 @@ if [[ "$(j '.solana.enabled // false')" == "true" ]]; then
       ga_retry register-asset --debridge-id "$native_did" --mint "$mint" --vault "$vault" >/dev/null \
         || die "register-asset $sym (solana-native id) failed"
       for cid in ${ASSET_CHAINS[$sym]:-}; do
-        local_tok="${TOKEN[$sym|$cid]}"
-        if [[ "$PROFILE" == "production" ]]; then
-          data="$(cast calldata 'setLocalToken(bytes32,address)' "$native_did" "$local_tok")"
-          CORRIDOR_CALLS="$(jq -c --argjson c "$cid" --arg to "${GATE[$cid]}" --arg d "$data" --arg sym "$sym" \
-            '. + [{chain_id: $c, to: $to, data: $d, note: ("register \($sym) inbound from Solana")}]' <<<"$CORRIDOR_CALLS")"
-        else
-          cur="$(cast call "${GATE[$cid]}" 'tokenOf(bytes32)(address)' "$native_did" --rpc-url "${RPC[$cid]}" 2>/dev/null || echo "")"
-          if [[ -z "$cur" || "$cur" =~ ^0x0{40}$ ]]; then
-            csend "${GATE[$cid]}" 'setLocalToken(bytes32,address)' "$native_did" "$local_tok" --rpc-url "${RPC[$cid]}"
-            info "chain $cid <- $sym from Solana ($native_did)"
-          fi
-        fi
+        register_corridor "$cid" "$native_did" "${TOKEN[$sym|$cid]}" "register $sym inbound from Solana"
       done
       ids="$(jq -c --arg d "$native_did" '. + [{from_chain: "solana", debridge_id: $d}]' <<<"$ids")"
     fi
@@ -686,6 +787,52 @@ if [[ "$(j '.solana.enabled // false')" == "true" ]]; then
       swap:$swap}')"
 fi
 
+# --- seal (H-1) — the LAST wiring step ---------------------------------------
+#
+# Irreversible. Afterwards every NEW corridor is scheduleGovernance + 48h, which
+# is what stops a stolen owner key from registering a worthless token behind a
+# real corridor and draining the pot in one block. Sits after the Solana leg
+# because that leg registers the Solana-native return corridors on the EVM gates.
+if [[ "$SEAL" == "true" ]]; then
+  say "sealing gates"
+  for cid in "${CHAIN_IDS[@]}"; do
+    if gate_sealed "${GATE[$cid]}" "${RPC[$cid]}"; then info "chain $cid: already sealed"; continue; fi
+    if gate_owned_by_us "${GATE[$cid]}" "${RPC[$cid]}"; then
+      csend "${GATE[$cid]}" 'seal()' --rpc-url "${RPC[$cid]}"
+      info "chain $cid: sealed"
+    else
+      gov_call "$cid" "${GATE[$cid]}" "$(cast calldata 'seal()')" "seal() — LAST, after every corridor above"
+      warn "chain $cid: not the gate owner — seal() written to governance_calls"
+    fi
+  done
+else
+  warn "gate.seal = false: the gates stay in their setup phase (setLocalToken instant). Dev only."
+fi
+
+# --- assert the wiring -------------------------------------------------------
+# Production: hard. A gate that is unsealed or missing a peer must not be
+# reported as deployed — that is precisely the state the multisig would fund.
+say "verifying gate wiring"
+wiring_ok=true
+for cid in "${CHAIN_IDS[@]}"; do
+  for peer in $(peers_of "$cid"); do
+    chain_supported "${GATE[$cid]}" "${RPC[$cid]}" "$peer" \
+      || { wiring_ok=false; warn "chain $cid gate ${GATE[$cid]}: supportedChain($peer) is false"; }
+  done
+  if [[ "$SEAL" == "true" ]] && ! gate_sealed "${GATE[$cid]}" "${RPC[$cid]}"; then
+    wiring_ok=false; warn "chain $cid gate ${GATE[$cid]}: NOT sealed"
+  fi
+  info "chain $cid: owner $(gate_owner "${GATE[$cid]}" "${RPC[$cid]}") sealed=$(gate_sealed "${GATE[$cid]}" "${RPC[$cid]}" && echo true || echo false)"
+done
+if ! $wiring_ok; then
+  if [[ "$PROFILE" == "production" ]]; then
+    # Still write the record first, so the governance_calls are not lost.
+    WIRING_FAILED=true
+  else
+    warn "wiring incomplete — see governance_calls in $OUT_FILE"
+  fi
+fi
+
 # --- record ----------------------------------------------------------------
 say "writing $OUT_FILE"
 mkdir -p "$(dirname "$OUT_FILE")"
@@ -762,11 +909,15 @@ if $UPDATE_CFG && [[ -n "$BRIDGE_CFG" ]]; then
   info "gate + token + start_block addresses written into the runtime config"
 fi
 
+if [[ "${WIRING_FAILED:-false}" == "true" ]]; then
+  die "production gate wiring is incomplete (unsealed gate or missing supportedChain — see above). The record and governance_calls are in $OUT_FILE; do NOT fund these gates until every check passes."
+fi
+
 say "done"
 info "addresses : $OUT_FILE"
 info "domain    : $BRIDGE_DOMAIN  (every gate in this mesh generation shares it)"
 [[ "$PROFILE" == "production" ]] && {
-  info "next      : the multisig $OWNER must call acceptOwnership() on every gate,"
-  info "            then execute .governance_calls from $OUT_FILE to register corridors"
+  info "next      : the multisig $OWNER must call acceptOwnership() on every gate"
+  [[ "$CORRIDOR_CALLS" != "[]" ]] && info "            then execute .governance_calls from $OUT_FILE (in order)"
 }
 info "run       : bash scripts/bridge-from-json.sh ${BRIDGE_CFG:-config/bridge.config.json}"

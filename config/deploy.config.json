@@ -17,7 +17,9 @@
     ],
     "threshold": 2,
     "guardian": null,
-    "owner": null
+    "owner": null,
+    "seal": true,
+    "extra_supported_chains": []
   },
   "chains": [
     {
@@ -82,7 +84,8 @@
       "run": true,
       "guardian": null,
       "max_validators": 8,
-      "max_corridors": 8
+      "max_corridors": 8,
+      "owner": null
     },
     "register_corridors": true,
     "assets": [

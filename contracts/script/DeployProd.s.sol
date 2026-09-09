@@ -21,6 +21,18 @@ import {GateDeployer} from "../src/GateDeployer.sol";
 ///   * asserts every post-deploy invariant and reverts the whole deployment if
 ///     any is off.
 ///
+/// POST-DEPLOY WIRING (done by the owner, NOT by this script, since it registers
+/// no corridors). The gate leaves here UNSEALED, i.e. in its setup phase, and
+/// the operator must — in this order, before provisioning any liquidity:
+///   1. `setSupportedChain(chainId, true)` for every peer chain `send` may
+///      target (M-3: an unlisted destination is refused, nothing is locked);
+///   2. `setLocalToken(debridgeId, localToken)` for every inbound corridor
+///      (instant while unsealed);
+///   3. `seal()` — irreversible. From then on every NEW corridor needs
+///      `scheduleGovernance(setLocalTokenActionId(...))` plus GOVERNANCE_DELAY,
+///      which is what stops an owner key from draining the gate through a fake
+///      corridor (H-1). An unsealed gate that holds funds is that drain waiting.
+///
 /// The deployment logic lives in `_deploy(Params)` so it can be unit-tested
 /// (see test/DeployProd.t.sol) without env plumbing or a live RPC.
 ///
@@ -78,6 +90,7 @@ contract DeployProd is Script {
         console2.log("  threshold:", gate.threshold());
         console2.log("  guardian:", gate.guardian());
         console2.log("  pendingOwner (accept from multisig):", gate.pendingOwner());
+        console2.log("  isSealed (seal() after wiring corridors, before funding):", gate.isSealed());
     }
 
     /// @dev Deploy + configure + assert. Public so tests can exercise it; the

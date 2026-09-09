@@ -44,6 +44,8 @@ contract SolanaBridgeTest is Test {
         address[] memory validators = new address[](1);
         validators[0] = address(0xA11CE);
         gate = deployTestGate(validators, 1);
+        gate.setSupportedChain(SOLANA_CHAIN_ID, true);
+        gate.setSupportedChain(1338, true);
 
         token = new TestToken("Test", "TST");
         token.mint(user, 1_000 ether);
@@ -53,7 +55,9 @@ contract SolanaBridgeTest is Test {
     }
 
     function test_Send_ToSolana_EmitsExpectedSubmissionId() public {
-        uint256 amount = 100 ether;
+        // 1e19 < 2^64: the widest an 18-decimal amount can be and still fit the
+        // Solana gate's u64 (H-3 caps 32-byte-receiver sends there).
+        uint256 amount = 10 ether;
         bytes memory autoParams = "";
         bytes memory nativeSender = abi.encodePacked(user);
 
@@ -84,10 +88,51 @@ contract SolanaBridgeTest is Test {
 
     function test_Send_ToSolana_LocksTokens() public {
         vm.prank(user);
+        gate.send(address(token), 10 ether, SOLANA_CHAIN_ID, SOLANA_RECEIVER, "");
+
+        assertEq(token.balanceOf(address(gate)), 10 ether, "gate did not hold funds");
+        assertEq(token.balanceOf(user), 990 ether, "user not debited");
+    }
+
+    // -----------------------------------------------------------------
+    // H-3: a non-EVM leg cannot carry an amount wider than u64
+    // -----------------------------------------------------------------
+
+    /// The Solana gate's ClaimArgs/CancelArgs carry `amount` as a u64 and the
+    /// relayer parses it as one, so an EVM->Solana transfer of >= 2^64 units could
+    /// be neither claimed nor cancelled — and without a cancel, never refunded.
+    /// `send` must refuse to lock it. (For an 18-decimal token that is ~18.44
+    /// whole tokens; nothing in this bridge normalises decimals.)
+    function test_Send_ToSolana_RevertsWhenAmountDoesNotFitU64() public {
+        uint256 tooWide = uint256(type(uint64).max) + 1;
+        token.mint(user, tooWide);
+        vm.prank(user);
+        vm.expectRevert(abi.encodeWithSelector(Gate.AmountTooWide.selector, tooWide));
+        gate.send(address(token), tooWide, SOLANA_CHAIN_ID, SOLANA_RECEIVER, "");
+
+        vm.prank(user);
+        vm.expectRevert(abi.encodeWithSelector(Gate.AmountTooWide.selector, 100 ether));
         gate.send(address(token), 100 ether, SOLANA_CHAIN_ID, SOLANA_RECEIVER, "");
 
-        assertEq(token.balanceOf(address(gate)), 100 ether, "gate did not hold funds");
-        assertEq(token.balanceOf(user), 900 ether, "user not debited");
+        assertEq(gate.nonceTo(SOLANA_CHAIN_ID), 0, "nothing was locked");
+    }
+
+    function test_Send_ToSolana_AcceptsExactlyU64Max() public {
+        uint256 widest = type(uint64).max;
+        token.mint(user, widest);
+        vm.prank(user);
+        gate.send(address(token), widest, SOLANA_CHAIN_ID, SOLANA_RECEIVER, "");
+        assertEq(gate.nonceTo(SOLANA_CHAIN_ID), 1);
+    }
+
+    /// The cap is keyed on the receiver WIDTH (the only signal `send` has for the
+    /// destination VM), so a 20-byte EVM receiver keeps the full uint256 range.
+    function test_Send_ToEvm_IsNotCappedAtU64() public {
+        uint256 wide = uint256(type(uint64).max) + 1;
+        token.mint(user, wide);
+        vm.prank(user);
+        gate.send(address(token), wide, 1338, abi.encodePacked(address(0xCAFE)), "");
+        assertEq(gate.nonceTo(1338), 1);
     }
 
     function test_Send_StillAccepts_20ByteEvmReceiver() public {
